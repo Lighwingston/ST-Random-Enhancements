@@ -9,18 +9,12 @@
  *   the character's appearance.
  */
 
-// Path from: /scripts/extensions/third-party/enhancements/index.js
-//   ../  = /scripts/extensions/third-party/
-//   ../../  = /scripts/extensions/
-//   ../../../  = /scripts/
-//   ../../../../  = /
-import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
+import { extension_settings } from '../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../script.js';
 import { eventSource, event_types } from '../../../events.js';
 import { isImageInliningSupported } from '../../../openai.js';
 import { getBase64Async } from '../../../utils.js';
 
-const EXTENSION_NAME = 'third-party/enhancements';
 const SETTINGS_KEY = 'enhancements';
 
 const defaultSettings = {
@@ -34,6 +28,46 @@ const defaultSettings = {
  * @type {Map<string, string>}
  */
 const avatarCache = new Map();
+
+// ---------------------------------------------------------------------------
+// Settings HTML (inlined to avoid template-path issues with folder names)
+// ---------------------------------------------------------------------------
+
+const settingsHtml = `
+<div id="enhancements_settings">
+    <div class="inline-drawer">
+        <div class="inline-drawer-toggle inline-drawer-header">
+            <div class="flex-container alignitemscenter margin0">
+                <b>Enhancements</b>
+            </div>
+            <div class="inline-drawer-icon fa-solid fa-circle-chevron-down down"></div>
+        </div>
+        <div class="inline-drawer-content">
+            <h4>Avatar Vision</h4>
+            <div class="flex-container marginTopBot5">
+                <label class="checkbox_label" for="enhancements_avatar_vision_enabled">
+                    <input type="checkbox" id="enhancements_avatar_vision_enabled" />
+                    <span>Send character avatar to AI</span>
+                </label>
+            </div>
+            <small class="textAlignCenter">
+                When enabled, the current character's avatar image is included in the
+                prompt so the AI can "see" the character's appearance. Requires a
+                vision-capable model and Media Inlining enabled in Chat Completion settings.
+            </small>
+            <div class="flex-container marginTopBot5">
+                <label class="checkbox_label" for="enhancements_avatar_vision_hint">
+                    <input type="checkbox" id="enhancements_avatar_vision_hint" />
+                    <span>Include text hint with avatar</span>
+                </label>
+            </div>
+            <small class="textAlignCenter">
+                Prepends a short text label before the image so the AI knows it
+                represents the character's appearance.
+            </small>
+        </div>
+    </div>
+</div>`;
 
 // ---------------------------------------------------------------------------
 // Settings management
@@ -179,8 +213,7 @@ async function onPromptReady(eventData) {
 // ---------------------------------------------------------------------------
 
 jQuery(async () => {
-    // Load the settings HTML template and mount it in the extensions panel
-    const settingsHtml = await renderExtensionTemplateAsync(EXTENSION_NAME, 'settings');
+    // Mount the settings panel directly (no external template file needed)
     const container = $('<div id="enhancements_container" class="extension_container"></div>');
     container.append(settingsHtml);
     $('#extensions_settings2').append(container);
