@@ -100,14 +100,12 @@ function bindUiEvents() {
 
 /**
  * Fetch a character's avatar image and return it as a base64 data-URL.
- * Always fetches fresh from the server (no stale cache).
  *
  * @param {string} avatarFile  The avatar filename, e.g. "MyChar.png"
  * @returns {Promise<string|null>}  data:image/…;base64,… or null on failure
  */
 async function fetchAvatarAsBase64(avatarFile) {
     try {
-        // Use absolute path — works correctly behind reverse proxies / tunnels
         const url = `/characters/${encodeURIComponent(avatarFile)}`;
         console.debug(`[Enhancements] Fetching avatar from: ${url}`);
 
@@ -131,8 +129,13 @@ async function fetchAvatarAsBase64(avatarFile) {
 /**
  * Event handler for CHAT_COMPLETION_PROMPT_READY.
  *
- * Injects the current character's avatar image into the first system message
- * of the chat completion prompt so vision-capable models can see the character.
+ * Injects the current character's avatar image as a separate "user" message
+ * near the top of the prompt (right after system messages). We use "user"
+ * role because:
+ *  - Gemini's system_instruction does NOT support images (only text parts)
+ *  - OpenAI and Claude both support images in user messages natively
+ *  - SillyTavern's prompt converter turns image_url into Gemini inlineData
+ *    only for non-system messages
  *
  * @param {object} eventData  { chat: Array, dryRun: boolean }
  */
@@ -172,37 +175,29 @@ async function onPromptReady(eventData) {
         return;
     }
 
-    // ---- Fetch avatar (always fresh, no cache — ensures correct character) ----
+    // ---- Fetch avatar ----
     const avatarBase64 = await fetchAvatarAsBase64(avatarFile);
     if (!avatarBase64) return;
 
-    // ---- Inject into the first system message ----
+    // ---- Build a new user message containing the avatar image ----
     const chat = eventData.chat;
     if (!chat || chat.length === 0) return;
 
-    const targetMessage = chat[0];
+    const charName = character.name || context.name2 || 'the character';
 
-    // Convert string content to the multi-part array format required for images
-    if (typeof targetMessage.content === 'string') {
-        targetMessage.content = [
-            { type: 'text', text: targetMessage.content },
-        ];
-    } else if (!Array.isArray(targetMessage.content)) {
-        console.debug('[Enhancements] Skipped: first message content is not string or array');
-        return;
-    }
+    // Build multipart content array for the injected message
+    const contentParts = [];
 
-    // Optionally add a text hint so the AI knows what the image represents
+    // Optional text hint
     if (settings.avatarVisionHint) {
-        const charName = character.name || context.name2 || 'the character';
-        targetMessage.content.push({
+        contentParts.push({
             type: 'text',
             text: `[The following image is ${charName}'s current appearance/avatar:]`,
         });
     }
 
-    // Append the avatar image
-    targetMessage.content.push({
+    // The avatar image
+    contentParts.push({
         type: 'image_url',
         image_url: {
             url: avatarBase64,
@@ -210,7 +205,26 @@ async function onPromptReady(eventData) {
         },
     });
 
-    console.log(`[Enhancements] Injected avatar for "${character.name}" (${avatarFile}) into prompt`);
+    // Create a user-role message with the avatar
+    const avatarMessage = {
+        role: 'user',
+        content: contentParts,
+    };
+
+    // Insert right after the leading system messages so the AI sees it
+    // early in context but it doesn't collide with system_instruction
+    let insertIndex = 0;
+    for (let i = 0; i < chat.length; i++) {
+        if (chat[i].role === 'system') {
+            insertIndex = i + 1;
+        } else {
+            break;
+        }
+    }
+
+    chat.splice(insertIndex, 0, avatarMessage);
+
+    console.log(`[Enhancements] Injected avatar for "${charName}" (${avatarFile}) as user message at index ${insertIndex}`);
 }
 
 // ---------------------------------------------------------------------------
