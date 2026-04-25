@@ -61,10 +61,14 @@ jQuery(async () => {
     const contentContainer = $('#enhancements_drawer_content');
 
     // Dynamically load and init every registered feature
+    // Using import.meta.url to build absolute URLs avoids relative-path ambiguity
+    const baseUrl = new URL('.', import.meta.url).href;
     let loaded = 0;
+
     for (const feature of FEATURES) {
         try {
-            const module = await import(feature.path);
+            const featureUrl = new URL(feature.path, baseUrl).href;
+            const module = await import(featureUrl);
             module.init(contentContainer);
             loaded++;
             console.log(`[Enhancements] Feature "${feature.name}" loaded`);
