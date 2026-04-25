@@ -4,26 +4,25 @@
  * Lightweight orchestrator that:
  *  1. Mounts the shared settings drawer shell
  *  2. Ensures the shared extension_settings bucket exists
- *  3. Loads every feature module from ./features/
+ *  3. Dynamically loads every feature module from ./features/
  *
  * To add a new feature:
  *  - Create a file in ./features/  (e.g. features/my-feature.js)
  *  - Export an  init(contentContainer)  function from it
- *  - Import and register it in the FEATURES array below
+ *  - Add an entry to the FEATURES array below
  */
 
 import { extension_settings } from '../../../extensions.js';
-import { init as avatarVisionInit } from './features/avatar-vision.js';
 
 const SETTINGS_KEY = 'enhancements';
 
 // ---------------------------------------------------------------------------
-// Register features here — each entry is { name, init }
+// Register features here — path is relative to this file
 // ---------------------------------------------------------------------------
 
 const FEATURES = [
-    { name: 'AvatarVision', init: avatarVisionInit },
-    // { name: 'NextFeature', init: nextFeatureInit },
+    { name: 'AvatarVision', path: './features/avatar-vision.js' },
+    // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 
 // ---------------------------------------------------------------------------
@@ -61,14 +60,18 @@ jQuery(async () => {
 
     const contentContainer = $('#enhancements_drawer_content');
 
-    // Init every registered feature
+    // Dynamically load and init every registered feature
+    let loaded = 0;
     for (const feature of FEATURES) {
         try {
-            feature.init(contentContainer);
+            const module = await import(feature.path);
+            module.init(contentContainer);
+            loaded++;
+            console.log(`[Enhancements] Feature "${feature.name}" loaded`);
         } catch (err) {
-            console.error(`[Enhancements] Failed to init feature "${feature.name}":`, err);
+            console.error(`[Enhancements] Failed to load feature "${feature.name}" from ${feature.path}:`, err);
         }
     }
 
-    console.log(`[Enhancements] Extension loaded (${FEATURES.length} feature(s))`);
+    console.log(`[Enhancements] Extension loaded (${loaded}/${FEATURES.length} features)`);
 });
