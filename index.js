@@ -9,8 +9,13 @@
  *   the character's appearance.
  */
 
-import { extension_settings, renderExtensionTemplateAsync } from '../../extensions.js';
-import { saveSettingsDebounced, characters, this_chid, name2 } from '../../../../script.js';
+// Path from: /scripts/extensions/third-party/enhancements/index.js
+//   ../  = /scripts/extensions/third-party/
+//   ../../  = /scripts/extensions/
+//   ../../../  = /scripts/
+//   ../../../../  = /
+import { extension_settings, renderExtensionTemplateAsync } from '../../../extensions.js';
+import { saveSettingsDebounced } from '../../../../script.js';
 import { eventSource, event_types } from '../../../events.js';
 import { isImageInliningSupported } from '../../../openai.js';
 import { getBase64Async } from '../../../utils.js';
@@ -117,11 +122,12 @@ async function onPromptReady(eventData) {
     if (eventData.dryRun) return;
     if (!isImageInliningSupported()) return;
 
-    // Identify the current character (works for both 1-on-1 and group chats)
-    const charId = this_chid;
+    // Use getContext() for live access to mutable globals
+    const context = SillyTavern.getContext();
+    const charId = context.characterId;
     if (charId === undefined || charId === null) return;
 
-    const character = characters[charId];
+    const character = context.characters[charId];
     if (!character) return;
 
     const avatarFile = character.avatar;
@@ -149,7 +155,7 @@ async function onPromptReady(eventData) {
 
     // Optionally add a text hint so the AI knows what the image represents
     if (settings.avatarVisionHint) {
-        const charName = character.name || name2 || 'the character';
+        const charName = character.name || context.name2 || 'the character';
         targetMessage.content.push({
             type: 'text',
             text: `[The following image is ${charName}'s current appearance/avatar:]`,
