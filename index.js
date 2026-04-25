@@ -22,13 +22,6 @@ const defaultSettings = {
     avatarVisionHint: true,
 };
 
-/**
- * Simple cache for avatar base64 data to avoid re-fetching on every generation.
- * Keyed by avatar filename (e.g. "MyChar.png").
- * @type {Map<string, string>}
- */
-const avatarCache = new Map();
-
 // ---------------------------------------------------------------------------
 // Settings HTML (inlined to avoid template-path issues with folder names)
 // ---------------------------------------------------------------------------
@@ -78,7 +71,6 @@ function loadSettings() {
         extension_settings[SETTINGS_KEY] = {};
     }
 
-    // Merge defaults with any previously-saved values
     const settings = extension_settings[SETTINGS_KEY];
     for (const [key, value] of Object.entries(defaultSettings)) {
         if (settings[key] === undefined) {
@@ -86,7 +78,6 @@ function loadSettings() {
         }
     }
 
-    // Reflect saved state in the UI
     $('#enhancements_avatar_vision_enabled').prop('checked', settings.avatarVisionEnabled);
     $('#enhancements_avatar_vision_hint').prop('checked', settings.avatarVisionHint);
 }
@@ -108,31 +99,28 @@ function bindUiEvents() {
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch a character avatar and return it as a base64 data-URL string.
- * Results are cached by filename.
+ * Fetch a character's avatar image and return it as a base64 data-URL.
+ * Always fetches fresh from the server (no stale cache).
  *
  * @param {string} avatarFile  The avatar filename, e.g. "MyChar.png"
  * @returns {Promise<string|null>}  data:image/…;base64,… or null on failure
  */
-async function getAvatarBase64(avatarFile) {
-    if (avatarCache.has(avatarFile)) {
-        return avatarCache.get(avatarFile);
-    }
-
+async function fetchAvatarAsBase64(avatarFile) {
     try {
-        const response = await fetch(`characters/${avatarFile}`, {
-            method: 'GET',
-            cache: 'force-cache',
-        });
+        // Use absolute path — works correctly behind reverse proxies / tunnels
+        const url = `/characters/${encodeURIComponent(avatarFile)}`;
+        console.debug(`[Enhancements] Fetching avatar from: ${url}`);
+
+        const response = await fetch(url, { method: 'GET' });
 
         if (!response.ok) {
-            console.warn(`[Enhancements] Failed to fetch avatar "${avatarFile}": ${response.status}`);
+            console.warn(`[Enhancements] Avatar fetch failed for "${avatarFile}": HTTP ${response.status}`);
             return null;
         }
 
         const blob = await response.blob();
         const base64 = await getBase64Async(blob);
-        avatarCache.set(avatarFile, base64);
+        console.debug(`[Enhancements] Avatar fetched OK, size: ${Math.round(base64.length / 1024)}KB`);
         return base64;
     } catch (error) {
         console.error('[Enhancements] Error fetching avatar:', error);
@@ -154,21 +142,38 @@ async function onPromptReady(eventData) {
     // ---- Gate checks ----
     if (!settings?.avatarVisionEnabled) return;
     if (eventData.dryRun) return;
-    if (!isImageInliningSupported()) return;
+    if (!isImageInliningSupported()) {
+        console.debug('[Enhancements] Skipped: image inlining not supported by current model/API');
+        return;
+    }
 
-    // Use getContext() for live access to mutable globals
+    // Read current character info at call time via getContext()
     const context = SillyTavern.getContext();
     const charId = context.characterId;
-    if (charId === undefined || charId === null) return;
+
+    console.debug(`[Enhancements] characterId = ${charId}, name2 = ${context.name2}`);
+
+    if (charId === undefined || charId === null) {
+        console.debug('[Enhancements] Skipped: no character selected');
+        return;
+    }
 
     const character = context.characters[charId];
-    if (!character) return;
+    if (!character) {
+        console.debug(`[Enhancements] Skipped: character not found at index ${charId}`);
+        return;
+    }
 
     const avatarFile = character.avatar;
-    if (!avatarFile || avatarFile === 'none') return;
+    console.debug(`[Enhancements] Character: "${character.name}", avatar file: "${avatarFile}"`);
 
-    // ---- Fetch avatar ----
-    const avatarBase64 = await getAvatarBase64(avatarFile);
+    if (!avatarFile || avatarFile === 'none') {
+        console.debug('[Enhancements] Skipped: character has no avatar');
+        return;
+    }
+
+    // ---- Fetch avatar (always fresh, no cache — ensures correct character) ----
+    const avatarBase64 = await fetchAvatarAsBase64(avatarFile);
     if (!avatarBase64) return;
 
     // ---- Inject into the first system message ----
@@ -183,7 +188,7 @@ async function onPromptReady(eventData) {
             { type: 'text', text: targetMessage.content },
         ];
     } else if (!Array.isArray(targetMessage.content)) {
-        // Unexpected content type — bail out gracefully
+        console.debug('[Enhancements] Skipped: first message content is not string or array');
         return;
     }
 
@@ -201,11 +206,11 @@ async function onPromptReady(eventData) {
         type: 'image_url',
         image_url: {
             url: avatarBase64,
-            detail: 'low', // 85 tokens — avatars are small reference images
+            detail: 'high',
         },
     });
 
-    console.debug(`[Enhancements] Injected avatar for "${character.name}" into prompt`);
+    console.log(`[Enhancements] Injected avatar for "${character.name}" (${avatarFile}) into prompt`);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,7 +218,6 @@ async function onPromptReady(eventData) {
 // ---------------------------------------------------------------------------
 
 jQuery(async () => {
-    // Mount the settings panel directly (no external template file needed)
     const container = $('<div id="enhancements_container" class="extension_container"></div>');
     container.append(settingsHtml);
     $('#extensions_settings2').append(container);
@@ -221,7 +225,6 @@ jQuery(async () => {
     loadSettings();
     bindUiEvents();
 
-    // Register the prompt-ready hook
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
 
     console.log('[Enhancements] Extension loaded');
