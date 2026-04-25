@@ -160,7 +160,7 @@ async function onPromptReady(eventData) {
     if (settings.avatarVisionHint) {
         contentParts.push({
             type: 'text',
-            text: `[The following image is ${charName}'s current appearance/avatar:]`,
+            text: `[The following image is ${charName}'s current appearance/avatar; ALWAYS (every response, do not skip!) use this image to describe, or add elements to describe (if character card already has written descriptions) character's appearance:],
         });
     }
 
