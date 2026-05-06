@@ -23,6 +23,7 @@ const SETTINGS_KEY = 'enhancements';
 const FEATURES = [
     { name: 'AvatarVision', path: './features/avatar-vision.js' },
     { name: 'CustomVectors', path: './features/custom-vectors.js' },
+    { name: 'AutoModelFetch', path: './features/auto-model-fetch.js' },
     // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 
