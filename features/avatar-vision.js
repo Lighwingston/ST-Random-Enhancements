@@ -81,12 +81,34 @@ function onSettingsChange() {
 // ---------------------------------------------------------------------------
 
 /**
+ * In-memory avatar cache to avoid re-fetching and re-encoding
+ * the same image on every generation.
+ *
+ * Keyed by avatar filename. Invalidated when:
+ *  - A different filename is requested (automatic — different key)
+ *  - The cache entry is older than AVATAR_CACHE_TTL (stale after re-upload)
+ */
+const avatarCache = { filename: null, base64: null, timestamp: 0 };
+const AVATAR_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+/**
  * Fetch a character's avatar image and return it as a base64 data-URL.
+ * Uses an in-memory cache to avoid redundant HTTP requests and base64
+ * encoding on every generation.
  *
  * @param {string} avatarFile  The avatar filename, e.g. "MyChar.png"
  * @returns {Promise<string|null>}  data:image/…;base64,… or null on failure
  */
 async function fetchAvatarAsBase64(avatarFile) {
+    // Check cache — same filename and not expired
+    const now = Date.now();
+    if (avatarCache.filename === avatarFile &&
+        avatarCache.base64 &&
+        (now - avatarCache.timestamp) < AVATAR_CACHE_TTL) {
+        console.debug('[Enhancements:AvatarVision] Using cached avatar');
+        return avatarCache.base64;
+    }
+
     try {
         const url = `/characters/${encodeURIComponent(avatarFile)}`;
         console.debug(`[Enhancements:AvatarVision] Fetching avatar from: ${url}`);
@@ -101,6 +123,12 @@ async function fetchAvatarAsBase64(avatarFile) {
         const blob = await response.blob();
         const base64 = await getBase64Async(blob);
         console.debug(`[Enhancements:AvatarVision] Avatar fetched OK, size: ${Math.round(base64.length / 1024)}KB`);
+
+        // Store in cache
+        avatarCache.filename = avatarFile;
+        avatarCache.base64 = base64;
+        avatarCache.timestamp = Date.now();
+
         return base64;
     } catch (error) {
         console.error('[Enhancements:AvatarVision] Error fetching avatar:', error);
