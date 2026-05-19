@@ -32,6 +32,13 @@ const LOG_PREFIX  = '[Enhancements:CustomEndpointType]';
 
 const defaultSettings = {
     customEndpointType: 'chat_completions',
+    // /messages (Anthropic) — sampling params forbidden on thinking-enabled
+    // and noSampling models (opus-4-7, sonnet-4-6 w/ thinking, etc.)
+    messagesExcludeTopP: false,
+    messagesExcludeTemperature: false,
+    messagesExcludeTopK: false,
+    // /responses (OpenAI) — store responses server-side for later retrieval
+    responsesStore: false,
 };
 
 function getSettings() {
@@ -41,6 +48,13 @@ function getSettings() {
 // ───────────────────────────────────────────────────────────────────
 // UI injection
 // ───────────────────────────────────────────────────────────────────
+
+/** Show/hide the endpoint-specific option panels */
+function updateEndpointOptionsVisibility() {
+    const type = getSettings().customEndpointType || 'chat_completions';
+    $('#enhancements_endpoint_opts_messages').toggle(type === 'messages');
+    $('#enhancements_endpoint_opts_responses').toggle(type === 'responses');
+}
 
 function injectUI() {
     const $form = $('#custom_form');
@@ -52,6 +66,11 @@ function injectUI() {
     // Guard against double-injection
     if ($('#enhancements_custom_endpoint_type').length) return;
 
+    // ── Rename the dropdown label (visual only) ──
+    $('#chat_completion_source option[value="custom"]')
+        .text('ENHANCED Custom Endpoint');
+
+    // ── Endpoint type selector + per-endpoint options ──
     const html = `
         <h4>Endpoint Type</h4>
         <div class="flex-container marginBot5">
@@ -60,20 +79,74 @@ function injectUI() {
                 <option value="messages">/messages</option>
                 <option value="responses">/responses</option>
             </select>
+        </div>
+
+        <div id="enhancements_endpoint_opts_messages" style="display:none">
+            <small class="textAlignCenter marginBot5" style="display:block">
+                Anthropic models restrict sampling parameters when extended
+                thinking is active, or on newer no-sampling models.
+            </small>
+            <label class="checkbox_label marginBot5" for="enh_msg_no_top_p">
+                <input type="checkbox" id="enh_msg_no_top_p" />
+                <span>Exclude <code>top_p</code> from request</span>
+            </label>
+            <label class="checkbox_label marginBot5" for="enh_msg_no_temperature">
+                <input type="checkbox" id="enh_msg_no_temperature" />
+                <span>Exclude <code>temperature</code> from request</span>
+            </label>
+            <label class="checkbox_label marginBot5" for="enh_msg_no_top_k">
+                <input type="checkbox" id="enh_msg_no_top_k" />
+                <span>Exclude <code>top_k</code> from request</span>
+            </label>
+        </div>
+
+        <div id="enhancements_endpoint_opts_responses" style="display:none">
+            <small class="textAlignCenter marginBot5" style="display:block">
+                Responses API options. Unsupported Chat-Completions
+                parameters are excluded automatically.
+            </small>
+            <label class="checkbox_label marginBot5" for="enh_resp_store">
+                <input type="checkbox" id="enh_resp_store" />
+                <span>Enable <code>store</code> (persist response server-side)</span>
+            </label>
         </div>`;
 
     $form.prepend(html);
 
-    // Restore saved value
+    // ── Restore saved values ──
     const s = getSettings();
     $('#enhancements_custom_endpoint_type')
         .val(s.customEndpointType || 'chat_completions');
+    $('#enh_msg_no_top_p').prop('checked', !!s.messagesExcludeTopP);
+    $('#enh_msg_no_temperature').prop('checked', !!s.messagesExcludeTemperature);
+    $('#enh_msg_no_top_k').prop('checked', !!s.messagesExcludeTopK);
+    $('#enh_resp_store').prop('checked', !!s.responsesStore);
 
-    // Persist on change
+    updateEndpointOptionsVisibility();
+
+    // ── Persist on change ──
     $('#enhancements_custom_endpoint_type').on('change', function () {
         getSettings().customEndpointType = String($(this).val());
         saveSettingsDebounced();
+        updateEndpointOptionsVisibility();
         console.log(`${LOG_PREFIX} Endpoint type → ${getSettings().customEndpointType}`);
+    });
+
+    $('#enh_msg_no_top_p').on('change', function () {
+        getSettings().messagesExcludeTopP = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#enh_msg_no_temperature').on('change', function () {
+        getSettings().messagesExcludeTemperature = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#enh_msg_no_top_k').on('change', function () {
+        getSettings().messagesExcludeTopK = $(this).prop('checked');
+        saveSettingsDebounced();
+    });
+    $('#enh_resp_store').on('change', function () {
+        getSettings().responsesStore = $(this).prop('checked');
+        saveSettingsDebounced();
     });
 }
 
@@ -91,6 +164,7 @@ function injectUI() {
  */
 function transformRequestForMessages(body) {
     const messages = body.messages || [];
+    const s = getSettings();
 
     // Pull system messages out of the array
     const systemParts = [];
@@ -122,7 +196,7 @@ function transformRequestForMessages(body) {
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
 
     // --- custom_exclude_body (YAML array, prepended) ---
-    body.custom_exclude_body = [
+    const excludes = [
         '- presence_penalty',
         '- frequency_penalty',
         '- logit_bias',
@@ -133,7 +207,14 @@ function transformRequestForMessages(body) {
         '- prompt',
         '- logprobs',
         '- top_logprobs',
-    ].join('\n') + '\n' + (body.custom_exclude_body || '');
+    ];
+    // Conditional sampling-parameter exclusions (Anthropic thinking / noSampling models)
+    if (s.messagesExcludeTopP)       excludes.push('- top_p');
+    if (s.messagesExcludeTemperature) excludes.push('- temperature');
+    if (s.messagesExcludeTopK)       excludes.push('- top_k');
+
+    body.custom_exclude_body =
+        excludes.join('\n') + '\n' + (body.custom_exclude_body || '');
 
     // --- custom_include_headers (add anthropic-version) ---
     body.custom_include_headers =
@@ -152,6 +233,7 @@ function transformRequestForMessages(body) {
  */
 function transformRequestForResponses(body) {
     const messages = body.messages || [];
+    const s = getSettings();
 
     // --- custom_include_body ---
     const includeLines = [];
@@ -159,6 +241,10 @@ function transformRequestForResponses(body) {
     const maxTok = body.max_completion_tokens || body.max_tokens;
     if (maxTok) {
         includeLines.push(`max_output_tokens: ${maxTok}`);
+    }
+    // Responses API "store" parameter — persists responses server-side
+    if (s.responsesStore) {
+        includeLines.push('store: true');
     }
     body.custom_include_body =
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
@@ -177,6 +263,7 @@ function transformRequestForResponses(body) {
         '- prompt',
         '- logprobs',
         '- top_logprobs',
+        '- top_k',
     ].join('\n') + '\n' + (body.custom_exclude_body || '');
 
     // --- URL fragment hack ---
