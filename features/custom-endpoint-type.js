@@ -195,26 +195,24 @@ function transformRequestForMessages(body) {
     body.custom_include_body =
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
 
-    // --- custom_exclude_body (YAML array, prepended) ---
-    const excludes = [
-        '- presence_penalty',
-        '- frequency_penalty',
-        '- logit_bias',
-        '- seed',
-        '- "n"',
-        '- stop',
-        '- max_completion_tokens',
-        '- prompt',
-        '- logprobs',
-        '- top_logprobs',
-    ];
-    // Conditional sampling-parameter exclusions (Anthropic thinking / noSampling models)
-    if (s.messagesExcludeTopP)       excludes.push('- top_p');
-    if (s.messagesExcludeTemperature) excludes.push('- temperature');
-    if (s.messagesExcludeTopK)       excludes.push('- top_k');
+    // --- Direct field deletion from request body ---
+    // The server reads these from request.body and puts them in requestBody;
+    // deleting them here makes them undefined → omitted from final JSON.
+    // This is more reliable than the YAML exclude mechanism.
+    delete body.presence_penalty;
+    delete body.frequency_penalty;
+    delete body.logit_bias;
+    delete body.seed;
+    delete body.n;
+    delete body.stop;
+    delete body.max_completion_tokens;
+    delete body.logprobs;
 
-    body.custom_exclude_body =
-        excludes.join('\n') + '\n' + (body.custom_exclude_body || '');
+    // Conditional sampling-parameter exclusions
+    // (Anthropic thinking-enabled / noSampling models like opus-4-7)
+    if (s.messagesExcludeTopP)        delete body.top_p;
+    if (s.messagesExcludeTemperature)  delete body.temperature;
+    if (s.messagesExcludeTopK)         delete body.top_k;
 
     // --- custom_include_headers (add anthropic-version) ---
     body.custom_include_headers =
@@ -249,22 +247,18 @@ function transformRequestForResponses(body) {
     body.custom_include_body =
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
 
-    // --- custom_exclude_body ---
-    body.custom_exclude_body = [
-        '- messages',
-        '- presence_penalty',
-        '- frequency_penalty',
-        '- logit_bias',
-        '- seed',
-        '- "n"',
-        '- stop',
-        '- max_tokens',
-        '- max_completion_tokens',
-        '- prompt',
-        '- logprobs',
-        '- top_logprobs',
-        '- top_k',
-    ].join('\n') + '\n' + (body.custom_exclude_body || '');
+    // --- Direct field deletion from request body ---
+    delete body.messages;
+    delete body.presence_penalty;
+    delete body.frequency_penalty;
+    delete body.logit_bias;
+    delete body.seed;
+    delete body.n;
+    delete body.stop;
+    delete body.max_tokens;
+    delete body.max_completion_tokens;
+    delete body.logprobs;
+    delete body.top_k;
 
     // --- URL fragment hack ---
     body.custom_url =
