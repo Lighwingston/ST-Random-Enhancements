@@ -25,7 +25,7 @@ const FEATURES = [
     { name: 'AvatarVision', path: './features/avatar-vision.js' },
     { name: 'CustomVectors', path: './features/custom-vectors.js' },
     { name: 'AutoModelFetch', path: './features/auto-model-fetch.js' },
-    { name: 'FreeModelProfile', path: './features/freemodel-profile.js' },
+    { name: 'FreeModelSource', path: './features/freemodel-source.js' },
     // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 
