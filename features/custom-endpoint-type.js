@@ -30,13 +30,6 @@ import { saveSettingsDebounced } from '../../../../../script.js';
 const SETTINGS_KEY = 'enhancements';
 const LOG_PREFIX  = '[Enhancements:CustomEndpointType]';
 
-// Stable per-session UUID for Claude Code spoof metadata.user_id
-const SPOOF_SESSION_ID = crypto.randomUUID?.() ||
-    'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-        const r = Math.random() * 16 | 0;
-        return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
-    });
-
 const defaultSettings = {
     customEndpointType: 'chat_completions',
     // /messages (Anthropic) — sampling params forbidden on thinking-enabled
@@ -44,8 +37,6 @@ const defaultSettings = {
     messagesExcludeTopP: false,
     messagesExcludeTemperature: false,
     messagesExcludeTopK: false,
-    // /messages (Anthropic) — spoof requests as Claude Code client
-    claudeCodeSpoof: false,
     // /responses (OpenAI) — store responses server-side for later retrieval
     responsesStore: false,
 };
@@ -107,15 +98,6 @@ function injectUI() {
                 <input type="checkbox" id="enh_msg_no_top_k" />
                 <span>Exclude <code>top_k</code> from request</span>
             </label>
-            <hr class="marginBot5 marginTop5" />
-            <label class="checkbox_label marginBot5" for="enh_msg_cc_spoof">
-                <input type="checkbox" id="enh_msg_cc_spoof" />
-                <span>Spoof as <b>Claude Code</b> client</span>
-            </label>
-            <small class="textAlignCenter" style="display:block; opacity:0.7">
-                Adds Claude Code headers and metadata so the request
-                looks like it was sent from the official CLI.
-            </small>
         </div>
 
         <div id="enhancements_endpoint_opts_responses" style="display:none">
@@ -138,7 +120,6 @@ function injectUI() {
     $('#enh_msg_no_top_p').prop('checked', !!s.messagesExcludeTopP);
     $('#enh_msg_no_temperature').prop('checked', !!s.messagesExcludeTemperature);
     $('#enh_msg_no_top_k').prop('checked', !!s.messagesExcludeTopK);
-    $('#enh_msg_cc_spoof').prop('checked', !!s.claudeCodeSpoof);
     $('#enh_resp_store').prop('checked', !!s.responsesStore);
 
     updateEndpointOptionsVisibility();
@@ -162,11 +143,6 @@ function injectUI() {
     $('#enh_msg_no_top_k').on('change', function () {
         getSettings().messagesExcludeTopK = $(this).prop('checked');
         saveSettingsDebounced();
-    });
-    $('#enh_msg_cc_spoof').on('change', function () {
-        getSettings().claudeCodeSpoof = $(this).prop('checked');
-        saveSettingsDebounced();
-        console.log(`${LOG_PREFIX} Claude Code spoof → ${getSettings().claudeCodeSpoof}`);
     });
     $('#enh_resp_store').on('change', function () {
         getSettings().responsesStore = $(this).prop('checked');
@@ -216,12 +192,6 @@ function transformRequestForMessages(body) {
         const arr = Array.isArray(body.stop) ? body.stop : [body.stop];
         includeLines.push(`stop_sequences: ${JSON.stringify(arr)}`);
     }
-
-    // Claude Code spoof — inject metadata.user_id
-    if (s.claudeCodeSpoof) {
-        includeLines.push(`metadata: {user_id: "${SPOOF_SESSION_ID}"}`);
-    }
-
     body.custom_include_body =
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
 
@@ -244,13 +214,9 @@ function transformRequestForMessages(body) {
     if (s.messagesExcludeTemperature)  delete body.temperature;
     if (s.messagesExcludeTopK)         delete body.top_k;
 
-    // --- custom_include_headers ---
-    let includeHeaders = 'anthropic-version: "2023-06-01"\n';
-    if (s.claudeCodeSpoof) {
-        includeHeaders += 'user-agent: "claude-code/1.0.34"\n';
-        includeHeaders += 'anthropic-beta: "interleaved-thinking-2025-05-14,prompt-caching-2024-07-31"\n';
-    }
-    body.custom_include_headers = includeHeaders + (body.custom_include_headers || '');
+    // --- custom_include_headers (add anthropic-version) ---
+    body.custom_include_headers =
+        'anthropic-version: "2023-06-01"\n' + (body.custom_include_headers || '');
 
     // --- URL fragment hack ---
     body.custom_url =
