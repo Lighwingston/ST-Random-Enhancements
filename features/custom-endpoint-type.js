@@ -85,14 +85,27 @@ When making changes to files, first understand the file's code conventions. Mimi
 
 // Environment block — Claude Code appends a short <env> section describing
 // the user's machine.  Real values are randomised once per session.
+// Single coherent machine profile.  The <env> block in the system prompt
+// and the x-stainless-* SDK headers MUST agree — a proxy that cross-checks
+// "node runtime + macOS header + linux env block" instantly spots the fake.
+const SPOOF_PLATFORM = {
+    // values used by both the env block and the stainless headers
+    stainlessOs: 'MacOS',
+    arch: 'arm64',
+    runtimeVersion: 'v22.11.0',
+    envPlatform: 'darwin',
+    envOsVersion: 'Darwin 24.1.0',
+    cwd: '/Users/user/project',
+};
+
 function buildEnvBlock() {
     const now = new Date();
     const dateStr = now.toISOString().slice(0, 10);
     return `\n<env>
-Working directory: /home/user/project
+Working directory: ${SPOOF_PLATFORM.cwd}
 Is directory a git repo: Yes
-Platform: linux
-OS Version: Linux 6.8.0-generic
+Platform: ${SPOOF_PLATFORM.envPlatform}
+OS Version: ${SPOOF_PLATFORM.envOsVersion}
 Today's date: ${dateStr}
 </env>
 You are powered by the model named Sonnet 4. The exact model ID is claude-sonnet-4-20250514.
@@ -433,6 +446,19 @@ function transformRequestForMessages(body) {
             }
         }
 
+        // Anthropic /messages REQUIRES the first message to be role:user.
+        // Roleplay chats frequently start with the character's greeting
+        // (an assistant message), which Anthropic rejects outright — and a
+        // gating proxy may flag the non-CC shape too.  Prepend a synthetic
+        // user turn so the sequence always starts with user, exactly like a
+        // real Claude Code session.
+        if (body.messages.length === 0 || body.messages[0].role !== 'user') {
+            body.messages.unshift({
+                role: 'user',
+                content: [{ type: 'text', text: '(start)' }],
+            });
+        }
+
         // Smuggle SillyTavern's actual prompt content (character card,
         // jailbreak, scenario, etc.) into the FIRST user message wrapped
         // as a <system-reminder>.  Real Claude Code uses this exact
@@ -537,6 +563,10 @@ function transformRequestForMessages(body) {
     if (s.claudeCodeSpoof) {
         // Headers Claude Code's official CLI sends.  Detection upstream
         // typically combines several of these into a fingerprint.
+        // NOTE: real Claude Code runs on Node and does NOT send
+        // 'anthropic-dangerous-direct-browser-access' (that's for browser
+        // SDK usage) — including it alongside x-stainless-runtime:node is
+        // self-contradictory, so we omit it.
         const ccHeaders = {
             'user-agent': `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
             'x-app': 'cli',
@@ -546,18 +576,23 @@ function transformRequestForMessages(body) {
                 'interleaved-thinking-2025-05-14',
                 'fine-grained-tool-streaming-2025-05-14',
             ].join(','),
-            'anthropic-dangerous-direct-browser-access': 'true',
-            // Anthropic's JS SDK (Stainless-generated) fingerprint headers
+            // Anthropic's JS SDK (Stainless-generated) fingerprint headers.
+            // These MUST match the <env> block's platform profile.
             'x-stainless-lang': 'js',
             'x-stainless-package-version': '0.55.1',
-            'x-stainless-os': 'MacOS',
-            'x-stainless-arch': 'arm64',
+            'x-stainless-os': SPOOF_PLATFORM.stainlessOs,
+            'x-stainless-arch': SPOOF_PLATFORM.arch,
             'x-stainless-runtime': 'node',
-            'x-stainless-runtime-version': 'v22.11.0',
+            'x-stainless-runtime-version': SPOOF_PLATFORM.runtimeVersion,
             'x-stainless-retry-count': '0',
-            'x-stainless-timeout': '600',
-            'x-stainless-helper-method': 'stream',
+            'x-stainless-timeout': '60',
         };
+        // The SDK only adds this header when the .stream() helper is used.
+        // Setting it on a non-streaming request is a tell, so make it
+        // conditional on the actual request mode.
+        if (body.stream === true) {
+            ccHeaders['x-stainless-helper-method'] = 'stream';
+        }
         for (const [k, v] of Object.entries(ccHeaders)) {
             includeHeaders += `${k}: ${JSON.stringify(v)}\n`;
         }
@@ -782,23 +817,63 @@ async function interceptedFetch(input, init) {
     // Debug: when Claude Code spoof is on, log the final outgoing shape
     // so the user can sanity-check what hits the proxy.
     if (endpointType === 'messages' && getSettings().claudeCodeSpoof) {
-        console.log(`${LOG_PREFIX} [Spoof] custom_include_body =\n${body.custom_include_body}`);
-        console.log(`${LOG_PREFIX} [Spoof] custom_include_headers =\n${body.custom_include_headers}`);
-        console.log(`${LOG_PREFIX} [Spoof] messages =`, body.messages);
+        console.groupCollapsed(`${LOG_PREFIX} [Spoof] outgoing request`);
+        console.log('custom_url:', body.custom_url);
+        console.log('model:', body.model);
+        console.log('stream:', body.stream);
+        console.log('temperature:', body.temperature, 'top_p:', body.top_p, 'top_k:', body.top_k);
+        console.log('custom_include_body (YAML):\n' + body.custom_include_body);
+        console.log('custom_include_headers (YAML):\n' + body.custom_include_headers);
+        console.log('messages:', JSON.parse(JSON.stringify(body.messages)));
+        console.groupEnd();
     }
 
     const modifiedInit = { ...init, body: JSON.stringify(body) };
     const response = await previousFetch(input, modifiedInit);
 
-    // Don't transform error responses
-    if (!response.ok) return response;
+    // Surface the proxy's rejection reason — invaluable for diagnosing
+    // "use Claude Code CLI" style gates.  We clone so the original body
+    // stream stays intact for SillyTavern's own error handling.
+    if (!response.ok) {
+        try {
+            const errText = await response.clone().text();
+            console.warn(`${LOG_PREFIX} [Spoof] upstream rejected (${response.status}):\n${errText}`);
+        } catch { /* ignore */ }
+        return response;
+    }
 
     // ── reshape response ──
     if (isStreaming) {
+        let src = response.body;
+
+        // Diagnostic tap: when spoofing, mirror the raw upstream stream to
+        // the console.  Some gating proxies answer 200 OK but stuff the
+        // "use Claude Code CLI" rejection into the stream body (which then
+        // shows as 0 tokens).  This lets us see that text.
+        if (endpointType === 'messages' && getSettings().claudeCodeSpoof) {
+            const [a, b] = src.tee();
+            src = a;
+            (async () => {
+                try {
+                    let raw = '';
+                    const reader = b.getReader();
+                    const dec = new TextDecoder();
+                    for (let i = 0; i < 50; i++) {
+                        const { done, value } = await reader.read();
+                        if (done) break;
+                        raw += dec.decode(value, { stream: true });
+                    }
+                    console.groupCollapsed(`${LOG_PREFIX} [Spoof] raw upstream stream (first chunks)`);
+                    console.log(raw.slice(0, 4000));
+                    console.groupEnd();
+                } catch { /* ignore */ }
+            })();
+        }
+
         const xform = endpointType === 'messages'
             ? createAnthropicStreamTransform()
             : createResponsesStreamTransform();
-        return new Response(response.body.pipeThrough(xform), {
+        return new Response(src.pipeThrough(xform), {
             status:     response.status,
             statusText: response.statusText,
             headers:    response.headers,
