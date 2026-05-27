@@ -65,13 +65,16 @@ jQuery(async () => {
     const contentContainer = $('#enhancements_drawer_content');
 
     // Dynamically load and init every registered feature
-    // Using import.meta.url to build absolute URLs avoids relative-path ambiguity
+    // Using import.meta.url to build absolute URLs avoids relative-path ambiguity.
+    // We append a per-page-load cache-buster so reverse proxies / Cloudflare
+    // tunnels can't serve stale feature modules during active development.
     const baseUrl = new URL('.', import.meta.url).href;
+    const cacheBust = `?v=${Date.now()}`;
     let loaded = 0;
 
     for (const feature of FEATURES) {
         try {
-            const featureUrl = new URL(feature.path, baseUrl).href;
+            const featureUrl = new URL(feature.path, baseUrl).href + cacheBust;
             const module = await import(featureUrl);
             module.init(contentContainer);
             loaded++;

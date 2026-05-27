@@ -1038,5 +1038,5 @@ export function init(_contentContainer) {
     }
 
     injectUI();
-    console.log(`${LOG_PREFIX} Ready  (endpoint: ${s.customEndpointType})`);
+    console.log(`${LOG_PREFIX} Ready  (endpoint: ${s.customEndpointType}, spoof CC ${CLAUDE_CODE_VERSION}, SDK ${STAINLESS_SDK_VERSION}, tools: ${CLAUDE_CODE_TOOLS.length})`);
 }
