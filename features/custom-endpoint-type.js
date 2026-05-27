@@ -880,6 +880,19 @@ async function interceptedFetch(input, init) {
         });
     }
 
+    // Diagnostic: a gating proxy may answer 200 OK but put the
+    // "use Claude Code CLI" rejection in the body (non-Anthropic shape),
+    // which then becomes an empty message.  Log the raw body so we can
+    // see exactly what came back.
+    if (endpointType === 'messages' && getSettings().claudeCodeSpoof) {
+        try {
+            const rawText = await response.clone().text();
+            console.groupCollapsed(`${LOG_PREFIX} [Spoof] raw upstream response (non-streaming, status ${response.status})`);
+            console.log(rawText.slice(0, 4000));
+            console.groupEnd();
+        } catch { /* ignore */ }
+    }
+
     return wrapNonStreamingResponse(response, endpointType);
 }
 
