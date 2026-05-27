@@ -30,6 +30,178 @@ import { saveSettingsDebounced } from '../../../../../script.js';
 const SETTINGS_KEY = 'enhancements';
 const LOG_PREFIX  = '[Enhancements:CustomEndpointType]';
 
+// ── Claude Code spoof — stable per-session identifiers ──
+// Claude Code generates these once per CLI invocation and reuses them
+// across all requests in that session.  We mirror that behaviour.
+function generateUUID() {
+    return crypto.randomUUID?.() ||
+        'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+            const r = Math.random() * 16 | 0;
+            return (c === 'x' ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+}
+
+// metadata.user_id format used by Claude Code:
+//   user_<64-hex>_account__session_<uuid>
+function generateClaudeCodeUserId() {
+    const hexChars = '0123456789abcdef';
+    let userHash = '';
+    for (let i = 0; i < 64; i++) {
+        userHash += hexChars[Math.floor(Math.random() * 16)];
+    }
+    return `user_${userHash}_account__session_${generateUUID()}`;
+}
+
+const SPOOF_USER_ID    = generateClaudeCodeUserId();
+const SPOOF_SESSION_ID = generateUUID();   // x-session-id / parent_tool_use_id
+
+// Claude Code identity prefix — THE single most important detection vector.
+// Every real Claude Code request starts its system array with exactly this
+// string as the first content block.  APIs that gate access on Claude-Code
+// usage check for this verbatim text.
+const CLAUDE_CODE_IDENTITY =
+    "You are Claude Code, Anthropic's official CLI for Claude.";
+
+// Version we identify as.  Bump occasionally to follow upstream releases.
+const CLAUDE_CODE_VERSION = '1.0.43';
+
+// ── Claude Code tool definitions for request spoofing ──
+// Minimal but realistic schemas matching the official CLI toolset.
+// cache_control on the last tool mirrors Claude Code's prompt-caching pattern.
+const CLAUDE_CODE_TOOLS = [
+    {
+        name: 'Read',
+        description: 'Read a file or directory from the local filesystem.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                file_path: { type: 'string', description: 'The absolute path to the file to read' },
+                offset: { type: 'integer', description: 'Line offset to start reading from' },
+                limit: { type: 'integer', description: 'Maximum number of lines to read' },
+            },
+            required: ['file_path'],
+        },
+    },
+    {
+        name: 'Write',
+        description: 'Write a file to the local filesystem. Overwrites existing files.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                file_path: { type: 'string', description: 'The absolute path to the file to write' },
+                content: { type: 'string', description: 'The content to write' },
+            },
+            required: ['file_path', 'content'],
+        },
+    },
+    {
+        name: 'Edit',
+        description: 'Perform exact string replacements in files.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                file_path: { type: 'string', description: 'The absolute path to the file to modify' },
+                old_string: { type: 'string', description: 'The text to replace' },
+                new_string: { type: 'string', description: 'The replacement text' },
+            },
+            required: ['file_path', 'old_string', 'new_string'],
+        },
+    },
+    {
+        name: 'Bash',
+        description: 'Execute a bash command in a persistent shell session.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                command: { type: 'string', description: 'The command to execute' },
+                timeout: { type: 'integer', description: 'Optional timeout in milliseconds' },
+                workdir: { type: 'string', description: 'Working directory for the command' },
+            },
+            required: ['command'],
+        },
+    },
+    {
+        name: 'Glob',
+        description: 'Fast file pattern matching tool that works with any codebase size.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                pattern: { type: 'string', description: 'The glob pattern to match files against' },
+                path: { type: 'string', description: 'The directory to search in' },
+            },
+            required: ['pattern'],
+        },
+    },
+    {
+        name: 'Grep',
+        description: 'Fast content search tool that works with any codebase size.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                pattern: { type: 'string', description: 'The regex pattern to search for' },
+                path: { type: 'string', description: 'The directory to search in' },
+                include: { type: 'string', description: 'File pattern to include in the search' },
+            },
+            required: ['pattern'],
+        },
+    },
+    {
+        name: 'WebFetch',
+        description: 'Fetch content from a specified URL.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                url: { type: 'string', description: 'The URL to fetch content from' },
+                format: { type: 'string', enum: ['text', 'markdown', 'html'], description: 'Output format' },
+            },
+            required: ['url'],
+        },
+    },
+    {
+        name: 'TodoRead',
+        description: 'Read the current task list.',
+        input_schema: {
+            type: 'object',
+            properties: {},
+        },
+    },
+    {
+        name: 'TodoWrite',
+        description: 'Create and manage a structured task list.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                todos: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            content: { type: 'string', description: 'Task description' },
+                            status: { type: 'string', enum: ['pending', 'in_progress', 'completed'] },
+                            priority: { type: 'string', enum: ['high', 'medium', 'low'] },
+                        },
+                        required: ['content', 'status'],
+                    },
+                },
+            },
+            required: ['todos'],
+        },
+    },
+    {
+        name: 'Task',
+        description: 'Launch a new agent to handle complex tasks autonomously.',
+        input_schema: {
+            type: 'object',
+            properties: {
+                description: { type: 'string', description: 'Short task description' },
+                prompt: { type: 'string', description: 'The task for the agent to perform' },
+            },
+            required: ['description', 'prompt'],
+        },
+        cache_control: { type: 'ephemeral' },
+    },
+];
+
 const defaultSettings = {
     customEndpointType: 'chat_completions',
     // /messages (Anthropic) — sampling params forbidden on thinking-enabled
@@ -37,6 +209,8 @@ const defaultSettings = {
     messagesExcludeTopP: false,
     messagesExcludeTemperature: false,
     messagesExcludeTopK: false,
+    // /messages (Anthropic) — spoof requests as Claude Code client
+    claudeCodeSpoof: false,
     // /responses (OpenAI) — store responses server-side for later retrieval
     responsesStore: false,
 };
@@ -98,6 +272,21 @@ function injectUI() {
                 <input type="checkbox" id="enh_msg_no_top_k" />
                 <span>Exclude <code>top_k</code> from request</span>
             </label>
+            <hr class="marginBot5 marginTop5" />
+            <label class="checkbox_label marginBot5" for="enh_msg_cc_spoof">
+                <input type="checkbox" id="enh_msg_cc_spoof" />
+                <span>Spoof as <b>Claude Code</b> client</span>
+            </label>
+            <small class="textAlignCenter" style="display:block; opacity:0.7">
+                Makes the request indistinguishable from the official
+                Claude Code CLI: prepends the
+                <code>"You are Claude Code…"</code> identity to the
+                system prompt, sets matching user-agent / x-app /
+                anthropic-beta / x-stainless-* headers, attaches the
+                CLI tool catalog, and uses the Claude Code
+                <code>metadata.user_id</code> format. For endpoints
+                that gate access to Claude Code users only.
+            </small>
         </div>
 
         <div id="enhancements_endpoint_opts_responses" style="display:none">
@@ -120,6 +309,7 @@ function injectUI() {
     $('#enh_msg_no_top_p').prop('checked', !!s.messagesExcludeTopP);
     $('#enh_msg_no_temperature').prop('checked', !!s.messagesExcludeTemperature);
     $('#enh_msg_no_top_k').prop('checked', !!s.messagesExcludeTopK);
+    $('#enh_msg_cc_spoof').prop('checked', !!s.claudeCodeSpoof);
     $('#enh_resp_store').prop('checked', !!s.responsesStore);
 
     updateEndpointOptionsVisibility();
@@ -143,6 +333,11 @@ function injectUI() {
     $('#enh_msg_no_top_k').on('change', function () {
         getSettings().messagesExcludeTopK = $(this).prop('checked');
         saveSettingsDebounced();
+    });
+    $('#enh_msg_cc_spoof').on('change', function () {
+        getSettings().claudeCodeSpoof = $(this).prop('checked');
+        saveSettingsDebounced();
+        console.log(`${LOG_PREFIX} Claude Code spoof → ${getSettings().claudeCodeSpoof}`);
     });
     $('#enh_resp_store').on('change', function () {
         getSettings().responsesStore = $(this).prop('checked');
@@ -182,9 +377,50 @@ function transformRequestForMessages(body) {
     }
     body.messages = nonSystemMessages;
 
+    // Claude Code spoof — structured content blocks + cache markers
+    if (s.claudeCodeSpoof) {
+        for (const msg of body.messages) {
+            if (typeof msg.content === 'string') {
+                msg.content = [{ type: 'text', text: msg.content }];
+            }
+        }
+        // Prompt caching: cache_control on the last user message
+        for (let i = body.messages.length - 1; i >= 0; i--) {
+            if (body.messages[i].role === 'user' && Array.isArray(body.messages[i].content)) {
+                const blocks = body.messages[i].content;
+                if (blocks.length > 0) {
+                    blocks[blocks.length - 1].cache_control = { type: 'ephemeral' };
+                }
+                break;
+            }
+        }
+    }
+
     // --- custom_include_body (YAML, prepended) ---
     const includeLines = [];
-    if (systemParts.length > 0) {
+    if (s.claudeCodeSpoof) {
+        // Claude Code ALWAYS sends system as a two-block array:
+        //   [0] = identity block ("You are Claude Code...")  — cache_control
+        //   [1] = the actual prompt / env block               — cache_control
+        // The first block is what gating APIs look for verbatim.
+        // We always emit both blocks even when SillyTavern provided no
+        // system content (e.g. on the built-in "test message" button).
+        const systemBlocks = [
+            {
+                type: 'text',
+                text: CLAUDE_CODE_IDENTITY,
+                cache_control: { type: 'ephemeral' },
+            },
+            {
+                type: 'text',
+                text: systemParts.length > 0
+                    ? systemParts.join('\n\n')
+                    : "\nYou are an interactive CLI tool that helps users with software engineering tasks.",
+                cache_control: { type: 'ephemeral' },
+            },
+        ];
+        includeLines.push(`system: ${JSON.stringify(systemBlocks)}`);
+    } else if (systemParts.length > 0) {
         includeLines.push(`system: ${JSON.stringify(systemParts.join('\n\n'))}`);
     }
     includeLines.push(`max_tokens: ${body.max_tokens || body.max_completion_tokens || 4096}`);
@@ -192,6 +428,16 @@ function transformRequestForMessages(body) {
         const arr = Array.isArray(body.stop) ? body.stop : [body.stop];
         includeLines.push(`stop_sequences: ${JSON.stringify(arr)}`);
     }
+
+    // Claude Code spoof — inject metadata and tools
+    if (s.claudeCodeSpoof) {
+        includeLines.push(`metadata: ${JSON.stringify({ user_id: SPOOF_USER_ID })}`);
+        includeLines.push(`tools: ${JSON.stringify(CLAUDE_CODE_TOOLS)}`);
+        // tool_choice:auto matches Claude Code's default — present even when
+        // the model isn't expected to call a tool.
+        includeLines.push(`tool_choice: ${JSON.stringify({ type: 'auto' })}`);
+    }
+
     body.custom_include_body =
         includeLines.join('\n') + '\n' + (body.custom_include_body || '');
 
@@ -214,9 +460,37 @@ function transformRequestForMessages(body) {
     if (s.messagesExcludeTemperature)  delete body.temperature;
     if (s.messagesExcludeTopK)         delete body.top_k;
 
-    // --- custom_include_headers (add anthropic-version) ---
-    body.custom_include_headers =
-        'anthropic-version: "2023-06-01"\n' + (body.custom_include_headers || '');
+    // --- custom_include_headers ---
+    let includeHeaders = 'anthropic-version: "2023-06-01"\n';
+    if (s.claudeCodeSpoof) {
+        // Headers Claude Code's official CLI sends.  Detection upstream
+        // typically combines several of these into a fingerprint.
+        const ccHeaders = {
+            'user-agent': `claude-cli/${CLAUDE_CODE_VERSION} (external, cli)`,
+            'x-app': 'cli',
+            'anthropic-beta': [
+                'claude-code-20250219',
+                'oauth-2025-04-20',
+                'interleaved-thinking-2025-05-14',
+                'fine-grained-tool-streaming-2025-05-14',
+            ].join(','),
+            'anthropic-dangerous-direct-browser-access': 'true',
+            // Anthropic's JS SDK (Stainless-generated) fingerprint headers
+            'x-stainless-lang': 'js',
+            'x-stainless-package-version': '0.55.1',
+            'x-stainless-os': 'MacOS',
+            'x-stainless-arch': 'arm64',
+            'x-stainless-runtime': 'node',
+            'x-stainless-runtime-version': 'v22.11.0',
+            'x-stainless-retry-count': '0',
+            'x-stainless-timeout': '600',
+            'x-stainless-helper-method': 'stream',
+        };
+        for (const [k, v] of Object.entries(ccHeaders)) {
+            includeHeaders += `${k}: ${JSON.stringify(v)}\n`;
+        }
+    }
+    body.custom_include_headers = includeHeaders + (body.custom_include_headers || '');
 
     // --- URL fragment hack ---
     body.custom_url =
