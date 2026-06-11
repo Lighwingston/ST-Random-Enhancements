@@ -26,6 +26,10 @@ const FEATURES = [
     { name: 'CustomVectors', path: './features/custom-vectors.js' },
     { name: 'AutoModelFetch', path: './features/auto-model-fetch.js' },
     { name: 'CustomEndpointType', path: './features/custom-endpoint-type.js' },
+    // StructuredPrefill loads AFTER CustomEndpointType so its window.fetch
+    // wrapper is the outermost one: it reshapes the request body first and
+    // unwraps the JSON response last.
+    { name: 'StructuredPrefill', path: './features/structured-prefill.js' },
     // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 
