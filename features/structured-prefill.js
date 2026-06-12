@@ -62,6 +62,9 @@ const defaultSettings = {
     spMinCharsAfterPrefix: 80,    // min chars the model must generate after the prefill
     spBannedWords: '',            // one banned word/phrase per line
     spCompatCache: {},            // { 'source|model': tier }  — auto-mode downgrade cache
+    spValidateRetry: true,        // re-generate when output violates the prefill/banned constraints
+    spMaxRetries: 2,              // max extra attempts before giving up and showing the last one
+    spFewShot: false,             // inject a one-shot JSON-format demonstration (json_object/prompt_only)
 };
 
 const TIER_ORDER = ['json_schema', 'json_object', 'prompt_only'];
@@ -522,6 +525,164 @@ function prependSystemMessage(body, content) {
     body.messages.unshift({ role: 'system', content });
 }
 
+// One-shot demonstration of the required JSON shape. Far more reliable than an
+// instruction alone on weak/open models, and costs nothing in API compatibility
+// (it's just messages). Only meaningful on the non-schema tiers.
+function buildFewShotMessages(ctx) {
+    const prefill = plainPrefillForInstruction(ctx.expectedPrefill);
+    const sample = prefill ? `${prefill} …` : 'Understood — here is my reply.';
+    return [
+        { role: 'system', content: 'Formatting example — your reply must use this exact JSON shape:' },
+        { role: 'assistant', content: JSON.stringify({ response: sample }) },
+    ];
+}
+
+function prependMessages(body, arr) {
+    if (!Array.isArray(body.messages) || !arr.length) return;
+    body.messages.unshift(...arr);
+}
+
+// ---------------------------------------------------------------------------
+// Output enforcement (validate-and-retry) — the only provider-independent way
+// to actually *force* compliance: we reject bad output and regenerate, since
+// that depends only on what we accept back, not on what the API supports.
+// ---------------------------------------------------------------------------
+
+function buildEnforcementValidator(ctx) {
+    ctx.validatorPrefixRegex = null;
+    const pf = String(ctx.expectedPrefill ?? '');
+    if (!pf) return;
+    try {
+        ctx.validatorPrefixRegex = new RegExp(`^(?:${buildPrefixRegexFromWireTemplate(pf)})`);
+    } catch {
+        ctx.validatorPrefixRegex = null;
+    }
+}
+
+// Validate the (unwrapped, pre-strip) text against the prefill + banned-word
+// constraints. Refusals are reported as acceptable so we never loop fighting a
+// model that has decided to decline.
+function validateOutput(text, ctx) {
+    const s = String(text ?? '');
+    if (s.trim().length === 0) return { ok: false, reason: 'empty' };
+    if (looksLikeModelRefusal(s)) return { ok: true, reason: 'refusal' };
+    if (ctx.validatorPrefixRegex && !ctx.validatorPrefixRegex.test(s)) {
+        return { ok: false, reason: 'prefix' };
+    }
+    if (ctx.bannedWords && ctx.bannedWords.length) {
+        const lower = s.toLowerCase();
+        const hit = ctx.bannedWords.find(w => lower.includes(String(w).toLowerCase()));
+        if (hit) return { ok: false, reason: `banned:${hit}` };
+    }
+    return { ok: true, reason: 'pass' };
+}
+
+function buildRetryNudge(reason, ctx) {
+    if (reason === 'prefix') {
+        return `Your previous attempt did NOT begin with the required text. Start your reply with this exact text, verbatim, and continue from it:\n${plainPrefillForInstruction(ctx.expectedPrefill)}`;
+    }
+    if (reason.startsWith('banned:')) {
+        return `Your previous attempt contained a forbidden word ("${reason.slice(7)}"). Rewrite the entire reply so that none of these words or phrases appear: ${(ctx.bannedWords || []).join(', ')}.`;
+    }
+    if (reason === 'empty') {
+        return 'Your previous attempt was empty. Produce a complete reply that satisfies the formatting constraints.';
+    }
+    return 'Revise your previous reply so it satisfies all stated formatting constraints.';
+}
+
+// Pull the model text out of a non-streaming chat-completions JSON payload.
+function extractContentFromJson(json) {
+    const c = json?.choices?.[0]?.message?.content;
+    return typeof c === 'string' ? c : null;
+}
+
+function buildSyntheticStreamResponse(display, upstream) {
+    const enc = new TextEncoder();
+    const stream = new ReadableStream({
+        start(ctl) {
+            if (display) ctl.enqueue(enc.encode(buildSseChunk(display, false)));
+            ctl.enqueue(enc.encode(buildSseChunk('', true)));
+            ctl.enqueue(enc.encode('data: [DONE]\n\n'));
+            ctl.close();
+        },
+    });
+    return new Response(stream, {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: upstream.headers,
+    });
+}
+
+function buildJsonResponse(display, json, upstream) {
+    if (json?.choices?.[0]?.message) json.choices[0].message.content = display;
+    return new Response(JSON.stringify(json), {
+        status: upstream.status,
+        statusText: upstream.statusText,
+        headers: upstream.headers,
+    });
+}
+
+// Run the request with buffered validate-and-retry. Upstream is forced to
+// non-streaming so each attempt can be validated in full; the accepted text is
+// then replayed to SillyTavern as a synthetic stream when the caller wanted one.
+async function runEnforcedAttempts(input, init, body, ctx, originalStreaming) {
+    const s = getSettings();
+    const maxAttempts = 1 + clampInt(s.spMaxRetries, 0, 6, 2);
+
+    let lastJson = null;
+    let lastUpstream = null;
+    let acceptedRaw = '';
+    let acceptedDisplay = '';
+
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        const attemptBody = { ...body, stream: false };
+        const upstream = await previousFetch(input, { ...init, body: JSON.stringify(attemptBody) });
+        if (!upstream.ok) return upstream; // surface errors to ST untouched
+
+        let json;
+        try {
+            json = await upstream.json();
+        } catch {
+            return upstream;
+        }
+
+        lastJson = json;
+        lastUpstream = upstream;
+
+        const rawContent = extractContentFromJson(json) ?? '';
+        const unwrapped = tryUnwrapStructuredOutput(rawContent, ctx);
+        const finalText = (unwrapped !== null) ? unwrapped : rawContent;
+
+        acceptedRaw = rawContent;
+        acceptedDisplay = stripHidePrefill(finalText, ctx);
+
+        const verdict = validateOutput(finalText, ctx);
+        if (verdict.ok || attempt === maxAttempts - 1) {
+            if (!verdict.ok) {
+                console.warn(`${LOG_PREFIX} Gave up after ${maxAttempts} attempts (last reason: ${verdict.reason})`);
+                try {
+                    window.toastr?.warning(
+                        `Structured Prefill: output still violated constraints after ${maxAttempts} attempts — showing the last reply.`,
+                        'Enhancements', { timeOut: 7000 },
+                    );
+                } catch { /* ignore */ }
+            } else if (attempt > 0) {
+                console.log(`${LOG_PREFIX} Compliant after ${attempt + 1} attempts.`);
+            }
+            break;
+        }
+
+        console.log(`${LOG_PREFIX} Attempt ${attempt + 1} rejected (${verdict.reason}) — retrying.`);
+        body.messages.push({ role: 'system', content: buildRetryNudge(verdict.reason, ctx) });
+    }
+
+    try { evaluateAndMaybeDowngrade(acceptedRaw, ctx); } catch { /* ignore */ }
+
+    return originalStreaming
+        ? buildSyntheticStreamResponse(acceptedDisplay, lastUpstream)
+        : buildJsonResponse(acceptedDisplay, lastJson, lastUpstream);
+}
+
 // ---------------------------------------------------------------------------
 // Streaming response transform — unwrap JSON deltas into clean text
 // ---------------------------------------------------------------------------
@@ -725,6 +886,7 @@ function prepareStructuredPrefill(body) {
         hidePrefillRegex: null,
     };
     if (ctx.hidePrefill) buildPrefillStripper(ctx, straightenCurlyQuotes(prefillTemplate));
+    buildEnforcementValidator(ctx);
 
     // ── Inject the constraint per tier ──
     if (tier === 'json_schema') {
@@ -734,8 +896,10 @@ function prepareStructuredPrefill(body) {
     } else if (tier === 'json_object') {
         setResponseFormat(body, source, { type: 'json_object' });
         prependSystemMessage(body, buildSystemInstruction('json_object', ctx));
+        if (s.spFewShot) prependMessages(body, buildFewShotMessages(ctx));
     } else {
         prependSystemMessage(body, buildSystemInstruction('prompt_only', ctx));
+        if (s.spFewShot) prependMessages(body, buildFewShotMessages(ctx));
     }
 
     console.log(`${LOG_PREFIX} Engaged: source=${source || '(?)'} tier=${tier} prefill=${ctx.expectedPrefill.length}ch banned=${bannedWords.length}`);
@@ -777,6 +941,19 @@ async function interceptedFetch(input, init) {
     }
 
     const isStreaming = body.stream === true;
+
+    // Enforcement path: buffer each attempt, validate, regenerate on violation.
+    // This is the only provider-independent way to *force* compliance — it
+    // depends on what we accept back, not on the API honouring response_format.
+    if (getSettings().spValidateRetry) {
+        try {
+            return await runEnforcedAttempts(input, init, body, ctx, isStreaming);
+        } catch (err) {
+            console.error(`${LOG_PREFIX} enforced attempts failed, passing through:`, err);
+            return previousFetch(input, { ...init, body: JSON.stringify(body) });
+        }
+    }
+
     const modifiedInit = { ...init, body: JSON.stringify(body) };
     const response = await previousFetch(input, modifiedInit);
 
@@ -835,6 +1012,30 @@ const settingsHtml = `
     </label>
 </div>
 
+<div class="flex-container marginTopBot5">
+    <label class="checkbox_label" for="enh_sp_validate_retry">
+        <input type="checkbox" id="enh_sp_validate_retry" />
+        <span>Enforce compliance (validate output &amp; regenerate on violation)</span>
+    </label>
+</div>
+<small class="textAlignCenter" style="display:block">
+    The only provider-independent way to actually <b>force</b> the prefill /
+    banned-word rules: each reply is checked client-side and regenerated if it
+    breaks them. Costs extra tokens &amp; latency per retry. Refusals are not retried.
+</small>
+
+<div class="flex-container flexFlowColumn marginTopBot5">
+    <label for="enh_sp_max_retries">Max regeneration attempts</label>
+    <input type="number" id="enh_sp_max_retries" class="text_pole" min="0" max="6" step="1" />
+</div>
+
+<div class="flex-container marginTopBot5">
+    <label class="checkbox_label" for="enh_sp_fewshot">
+        <input type="checkbox" id="enh_sp_fewshot" />
+        <span>Inject one-shot JSON format example (boosts weak/open models)</span>
+    </label>
+</div>
+
 <div class="flex-container flexFlowColumn marginTopBot5">
     <label for="enh_sp_min_chars">Minimum characters after prefix</label>
     <input type="number" id="enh_sp_min_chars" class="text_pole" min="1" max="10000" step="1" />
@@ -890,6 +1091,9 @@ function loadSettings() {
     $('#enh_sp_enabled').prop('checked', !!s.structuredPrefillEnabled);
     $('#enh_sp_mode').val(s.spMode);
     $('#enh_sp_hide_prefill').prop('checked', !!s.spHidePrefill);
+    $('#enh_sp_validate_retry').prop('checked', !!s.spValidateRetry);
+    $('#enh_sp_max_retries').val(s.spMaxRetries);
+    $('#enh_sp_fewshot').prop('checked', !!s.spFewShot);
     $('#enh_sp_min_chars').val(s.spMinCharsAfterPrefix);
     $('#enh_sp_newline_token').val(s.spNewlineToken);
     $('#enh_sp_banned_words').val(s.spBannedWords);
@@ -914,6 +1118,19 @@ export function init(contentContainer) {
     });
     $('#enh_sp_hide_prefill').on('change', function () {
         getSettings().spHidePrefill = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+    $('#enh_sp_validate_retry').on('change', function () {
+        getSettings().spValidateRetry = $(this).is(':checked');
+        saveSettingsDebounced();
+    });
+    $('#enh_sp_max_retries').on('change', function () {
+        getSettings().spMaxRetries = clampInt($(this).val(), 0, 6, 2);
+        $(this).val(getSettings().spMaxRetries);
+        saveSettingsDebounced();
+    });
+    $('#enh_sp_fewshot').on('change', function () {
+        getSettings().spFewShot = $(this).is(':checked');
         saveSettingsDebounced();
     });
     $('#enh_sp_min_chars').on('change', function () {
