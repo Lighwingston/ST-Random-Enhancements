@@ -30,6 +30,9 @@ const defaultSettings = {
     customVectorsApiUrl: '',
     customVectorsApiKey: '',
     customVectorsModel: '',
+    // 'openai'  → POST {input, model} to /v1/embeddings  (OpenAI-compatible)
+    // 'gemini'  → POST Google-native :batchEmbedContents  (Generative Language API)
+    customVectorsFormat: 'openai',
 };
 
 // ---------------------------------------------------------------------------
@@ -45,8 +48,18 @@ const settingsHtml = `
     <code>/v1/embeddings</code> endpoint.
 </small>
 <div class="flex-container flexFlowColumn marginTopBot5">
+    <label for="enhancements_custom_vectors_format">
+        API Format
+    </label>
+    <select id="enhancements_custom_vectors_format" class="text_pole">
+        <option value="openai">OpenAI compatible (/v1/embeddings)</option>
+        <option value="gemini">Google Gemini (native :batchEmbedContents)</option>
+    </select>
+</div>
+<div class="flex-container flexFlowColumn marginTopBot5">
     <label for="enhancements_custom_vectors_api_url">
-        API URL <small>(base URL, e.g. <code>http://localhost:1234/v1</code>)</small>
+        API URL <small>(OpenAI: base URL, e.g. <code>http://localhost:1234/v1</code>;
+        Gemini: full endpoint URL, e.g. <code>https://linkapi.ai/embeddings</code>)</small>
     </label>
     <input id="enhancements_custom_vectors_api_url" class="text_pole" type="text"
            placeholder="http://localhost:1234/v1" />
@@ -75,7 +88,7 @@ function getSettings() {
 }
 
 /**
- * Calls the custom OpenAI-compatible /v1/embeddings endpoint.
+ * Computes embeddings using the configured API format (OpenAI or Gemini).
  * @param {string[]} texts - Texts to embed
  * @returns {Promise<number[][]>} Array of embedding vectors
  */
@@ -84,10 +97,22 @@ async function computeCustomEmbeddings(texts) {
     const apiUrl = (s.customVectorsApiUrl || '').replace(/\/+$/, '');
     const apiKey = s.customVectorsApiKey || '';
     const model = s.customVectorsModel || '';
+    const format = s.customVectorsFormat || 'openai';
 
     if (!apiUrl) throw new Error(`${LOG_PREFIX} API URL is not configured`);
     if (!model) throw new Error(`${LOG_PREFIX} Model is not configured`);
 
+    if (format === 'gemini') {
+        return computeGeminiEmbeddings(texts, apiUrl, apiKey, model);
+    }
+    return computeOpenAIEmbeddings(texts, apiUrl, apiKey, model);
+}
+
+/**
+ * Calls an OpenAI-compatible /v1/embeddings endpoint.
+ * @returns {Promise<number[][]>}
+ */
+async function computeOpenAIEmbeddings(texts, apiUrl, apiKey, model) {
     // Build the full URL — append /embeddings if not already present
     let url = apiUrl;
     if (!url.endsWith('/embeddings')) {
@@ -105,15 +130,10 @@ async function computeCustomEmbeddings(texts) {
         headers['Authorization'] = `Bearer ${apiKey}`;
     }
 
-    console.log(`${LOG_PREFIX} Requesting embeddings for ${texts.length} text(s) from ${url}`);
+    console.log(`${LOG_PREFIX} [OpenAI] Requesting embeddings for ${texts.length} text(s) from ${url}`);
 
     // Per the OpenAI spec, `input` may be a string OR an array of strings.
-    // Some OpenAI-compatible bridges (notably Gemini/Google proxies) mishandle
-    // a single-element array: they route to the singular ":embedContent" path
-    // but still wrap the body as a batch `{ requests: [...] }`, which the
-    // upstream rejects with: Unknown name "requests": Cannot find field.
-    // Sending a plain string for the single-text case avoids that path and is
-    // fully spec-compliant. Arrays are kept only for genuine multi-text batches.
+    // Sending a plain string for the single-text case is the most compatible.
     const inputPayload = texts.length === 1 ? texts[0] : texts;
 
     // Use originalFetch to bypass our own interceptor
@@ -140,6 +160,56 @@ async function computeCustomEmbeddings(texts) {
 }
 
 /**
+ * Sends a Gemini-style embeddings request. Only the request/response SHAPE is
+ * Gemini-native — the URL and API key are used exactly as the user configured
+ * them (no path/version normalization).
+ * Request:  { requests: [ { model, content: { parts: [{ text }] } }, ... ] }
+ * Response: { embeddings: [ { values: [...] }, ... ] }  (order preserved)
+ * @returns {Promise<number[][]>}
+ */
+async function computeGeminiEmbeddings(texts, apiUrl, apiKey, model) {
+    // Use the URL exactly as configured by the user — no changes.
+    const url = apiUrl;
+
+    // Gemini model names are addressed as "models/<name>"
+    const modelPath = model.startsWith('models/') ? model : `models/${model}`;
+
+    const headers = { 'Content-Type': 'application/json' };
+    if (apiKey) {
+        headers['Authorization'] = `Bearer ${apiKey}`;
+    }
+
+    console.log(`${LOG_PREFIX} [Gemini] Requesting embeddings for ${texts.length} text(s) from ${url}`);
+
+    const reqBody = {
+        requests: texts.map(text => ({
+            model: modelPath,
+            content: { parts: [{ text }] },
+        })),
+    };
+
+    const response = await originalFetch(url, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify(reqBody),
+    });
+
+    if (!response.ok) {
+        const errText = await response.text();
+        throw new Error(`${LOG_PREFIX} Embeddings API error ${response.status}: ${errText}`);
+    }
+
+    const data = await response.json();
+
+    if (!Array.isArray(data?.embeddings)) {
+        throw new Error(`${LOG_PREFIX} Unexpected Gemini API response (missing embeddings array)`);
+    }
+
+    // batchEmbedContents preserves request order
+    return data.embeddings.map(e => e.values);
+}
+
+/**
  * Returns a stable model identifier used for vector storage scoping.
  * This keeps custom vectors separate from actual webllm vectors.
  */
@@ -147,7 +217,8 @@ function getStorageModelId() {
     const s = getSettings();
     const url = s.customVectorsApiUrl || 'unknown';
     const model = s.customVectorsModel || 'default';
-    return `custom_openai__${model}__${simpleHash(url)}`;
+    const format = s.customVectorsFormat || 'openai';
+    return `custom_${format}__${model}__${simpleHash(url)}`;
 }
 
 /** Simple numeric hash for a string */
@@ -385,6 +456,13 @@ export function init(contentContainer) {
         .val(s.customVectorsModel || '')
         .on('input', function () {
             getSettings().customVectorsModel = String($(this).val());
+            saveSettingsDebounced();
+        });
+
+    $('#enhancements_custom_vectors_format')
+        .val(s.customVectorsFormat || 'openai')
+        .on('change', function () {
+            getSettings().customVectorsFormat = String($(this).val());
             saveSettingsDebounced();
         });
 
