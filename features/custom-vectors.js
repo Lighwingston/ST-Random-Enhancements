@@ -107,11 +107,20 @@ async function computeCustomEmbeddings(texts) {
 
     console.log(`${LOG_PREFIX} Requesting embeddings for ${texts.length} text(s) from ${url}`);
 
+    // Per the OpenAI spec, `input` may be a string OR an array of strings.
+    // Some OpenAI-compatible bridges (notably Gemini/Google proxies) mishandle
+    // a single-element array: they route to the singular ":embedContent" path
+    // but still wrap the body as a batch `{ requests: [...] }`, which the
+    // upstream rejects with: Unknown name "requests": Cannot find field.
+    // Sending a plain string for the single-text case avoids that path and is
+    // fully spec-compliant. Arrays are kept only for genuine multi-text batches.
+    const inputPayload = texts.length === 1 ? texts[0] : texts;
+
     // Use originalFetch to bypass our own interceptor
     const response = await originalFetch(url, {
         method: 'POST',
         headers,
-        body: JSON.stringify({ input: texts, model }),
+        body: JSON.stringify({ input: inputPayload, model }),
     });
 
     if (!response.ok) {
