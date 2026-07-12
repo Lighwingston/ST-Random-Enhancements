@@ -25,9 +25,14 @@
  *     and we unwrap that JSON back into clean text for display.
  *
  *  2. Banned Words (anti-slop)
- *     A list of words/phrases that must never appear in the output. On the
- *     json_schema tier these are baked into the regex via negative lookaheads;
- *     on weaker tiers they are added to a system instruction.
+ *     A list of words/phrases that must never appear in the output. Has its
+ *     own enable toggle, independent of Structured Prefill. Enforced via a
+ *     system instruction + validate-and-retry on every tier. (They are
+ *     deliberately NOT baked into the schema regex as lookaheads — most
+ *     grammar-based structured-output engines reject or mis-compile (?!...)
+ *     and then emit an empty string.) When Structured Prefill is off (or no
+ *     prefill message exists), banned words run STANDALONE via a plain system
+ *     instruction — no JSON wrapping at all, so they can't break responses.
  *
  * Compatibility ladder (three tiers, same idea as the Spindle fork):
  *   json_schema  — full regex-locked structured output (real OpenAI / proxies)
@@ -60,6 +65,7 @@ const defaultSettings = {
     spHidePrefill: true,          // strip the prefill text from the displayed message
     spNewlineToken: '\\n',        // how newlines are encoded inside the JSON pattern
     spMinCharsAfterPrefix: 80,    // min chars the model must generate after the prefill
+    bannedWordsEnabled: false,    // banned words toggle — independent of the prefill
     spBannedWords: '',            // one banned word/phrase per line
     spCompatCache: {},            // { 'source|model': tier }  — auto-mode downgrade cache
     spValidateRetry: true,        // re-generate when output violates the prefill/banned constraints
@@ -194,7 +200,10 @@ function splitEndPrefillTemplate(prefixTemplate) {
 // ── Regex pattern building ──────────────────────────────────────────────────
 
 function anyCharIncludingNewlineExpr() {
-    return '[\\t\\n\\r \\x21-\\x7E\\x80-\\uFFFF]';
+    // Deliberately dead-simple: \xNN / ￿ escapes inside char classes are
+    // rejected or mis-compiled by several grammar engines (xgrammar, outlines,
+    // llama.cpp), which then constrain the model into an empty string.
+    return '[\\s\\S]';
 }
 
 function buildSlotRegex(slotContent) {
@@ -241,13 +250,6 @@ function parseBannedWords(raw) {
         .filter(Boolean);
 }
 
-// Build an any-char expression that forbids the banned words/phrases.
-function buildAntiSlopContinuation(bannedWords) {
-    if (!bannedWords || bannedWords.length === 0) return '';
-    const lookaheads = bannedWords.map(w => `(?!${escapeRegExp(w)})`).join('');
-    return `(?:${lookaheads}${anyCharIncludingNewlineExpr()})`;
-}
-
 /**
  * Build the OpenAI json_schema object whose `response` string is regex-locked
  * to start with the prefill and (optionally) avoid the banned words.
@@ -267,9 +269,12 @@ function buildJsonSchemaForPrefill(ctx, prefix, minCharsAfterPrefix, mustEndAfte
         prefixRegex = prefixRegex.split(escapedToken).join(`(?:${escapedToken}|\\n)`);
     }
 
-    const defaultAnyChar = anyCharIncludingNewlineExpr();
-    const antiSlopExpr = buildAntiSlopContinuation(ctx.bannedWords);
-    const anyChar = antiSlopExpr || defaultAnyChar;
+    // NOTE: banned words are deliberately NOT woven in here as (?!...)
+    // lookaheads — grammar-based structured-output engines (OpenAI strict,
+    // xgrammar, outlines, llama.cpp) don't support lookaheads and compile the
+    // pattern into a dead end: the model emits {"response":" and then stalls,
+    // producing an empty reply. Banned words ride a system instruction instead.
+    const anyChar = anyCharIncludingNewlineExpr();
 
     let pattern;
     if (mustEndAfterTemplate) {
@@ -606,26 +611,52 @@ function buildSyntheticStreamResponse(display, upstream) {
             ctl.close();
         },
     });
+    // Fresh headers: the buffered upstream was application/json with its own
+    // content-length — replaying those on an SSE body confuses consumers.
     return new Response(stream, {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: upstream.headers,
+        status: upstream?.status ?? 200,
+        statusText: upstream?.statusText ?? 'OK',
+        headers: { 'Content-Type': 'text/event-stream' },
     });
 }
 
 function buildJsonResponse(display, json, upstream) {
     if (json?.choices?.[0]?.message) json.choices[0].message.content = display;
     return new Response(JSON.stringify(json), {
-        status: upstream.status,
-        statusText: upstream.statusText,
-        headers: upstream.headers,
+        status: upstream?.status ?? 200,
+        statusText: upstream?.statusText ?? 'OK',
+        headers: { 'Content-Type': 'application/json' },
     });
+}
+
+// Downgrade the tier MID-GENERATION: rebuild the request from the pristine
+// original body at the next weaker tier. Returns {body, ctx} or null when
+// there is nothing weaker to fall back to.
+function rebuildAtWeakerTier(originalRawBody, ctx) {
+    const weaker = nextTier(ctx.tier);
+    if (!weaker) return null;
+    try {
+        const freshBody = JSON.parse(originalRawBody);
+        const freshCtx = prepareRequest(freshBody, weaker);
+        if (!freshCtx) return null;
+        setCachedTier(ctx.sourceKey, weaker);
+        return { body: freshBody, ctx: freshCtx };
+    } catch (err) {
+        console.warn(`${LOG_PREFIX} Tier rebuild failed:`, err);
+        return null;
+    }
 }
 
 // Run the request with buffered validate-and-retry. Upstream is forced to
 // non-streaming so each attempt can be validated in full; the accepted text is
 // then replayed to SillyTavern as a synthetic stream when the caller wanted one.
-async function runEnforcedAttempts(input, init, body, ctx, originalStreaming) {
+//
+// Crucially, an empty / non-JSON / HTTP-rejected response does NOT re-send the
+// same request — that's the schema being unsupported, not the model misbehaving.
+// Instead the tier is downgraded immediately (json_schema → json_object →
+// prompt_only) and the attempt is retried at the weaker tier within the same
+// generation. Retry-with-nudge is reserved for genuine content violations.
+async function runEnforcedAttempts(input, init, originalRawBody, body, ctx, originalStreaming) {
     const s = getSettings();
     const maxAttempts = 1 + clampInt(s.spMaxRetries, 0, 6, 2);
 
@@ -637,7 +668,21 @@ async function runEnforcedAttempts(input, init, body, ctx, originalStreaming) {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         const attemptBody = { ...body, stream: false };
         const upstream = await previousFetch(input, { ...init, body: JSON.stringify(attemptBody) });
-        if (!upstream.ok) return upstream; // surface errors to ST untouched
+
+        // A 4xx at a schema tier usually means "response_format not supported
+        // here" (real OpenAI rejects `pattern` outright) — drop a tier and go
+        // again instead of surfacing the error.
+        if (!upstream.ok) {
+            if (!ctx.plain && upstream.status >= 400 && upstream.status < 500 && ctx.tier !== 'prompt_only') {
+                const rebuilt = rebuildAtWeakerTier(originalRawBody, ctx);
+                if (rebuilt) {
+                    console.warn(`${LOG_PREFIX} HTTP ${upstream.status} at tier ${ctx.tier} — downgrading to ${rebuilt.ctx.tier} and retrying.`);
+                    ({ body, ctx } = rebuilt);
+                    continue;
+                }
+            }
+            return upstream; // surface errors to ST untouched
+        }
 
         let json;
         try {
@@ -650,19 +695,35 @@ async function runEnforcedAttempts(input, init, body, ctx, originalStreaming) {
         lastUpstream = upstream;
 
         const rawContent = extractContentFromJson(json) ?? '';
-        const unwrapped = tryUnwrapStructuredOutput(rawContent, ctx);
+        // Plain (banned-words-only) mode has no JSON wrapper to unwrap.
+        const unwrapped = ctx.plain ? null : tryUnwrapStructuredOutput(rawContent, ctx);
         const finalText = (unwrapped !== null) ? unwrapped : rawContent;
 
         acceptedRaw = rawContent;
         acceptedDisplay = stripHidePrefill(finalText, ctx);
 
         const verdict = validateOutput(finalText, ctx);
+
+        // Empty or JSON-shaped-but-unparseable output at a schema tier =
+        // constrained decoding dead-ended. Nudging can't fix that; downgrade.
+        const schemaDeadEnd = !verdict.ok && !ctx.plain && ctx.tier !== 'prompt_only'
+            && (verdict.reason === 'empty' || (unwrapped === null && !looksLikeModelRefusal(rawContent)));
+        if (schemaDeadEnd && attempt < maxAttempts - 1) {
+            const rebuilt = rebuildAtWeakerTier(originalRawBody, ctx);
+            if (rebuilt) {
+                console.warn(`${LOG_PREFIX} ${verdict.reason} response at tier ${ctx.tier} — downgrading to ${rebuilt.ctx.tier} and retrying.`);
+                ({ body, ctx } = rebuilt);
+                continue;
+            }
+        }
+
         if (verdict.ok || attempt === maxAttempts - 1) {
             if (!verdict.ok) {
                 console.warn(`${LOG_PREFIX} Gave up after ${maxAttempts} attempts (last reason: ${verdict.reason})`);
                 try {
+                    const label = ctx.plain ? 'Banned Words' : 'Structured Prefill';
                     window.toastr?.warning(
-                        `Structured Prefill: output still violated constraints after ${maxAttempts} attempts — showing the last reply.`,
+                        `${label}: output still violated constraints after ${maxAttempts} attempts — showing the last reply.`,
                         'Enhancements', { timeOut: 7000 },
                     );
                 } catch { /* ignore */ }
@@ -821,14 +882,15 @@ function evaluateAndMaybeDowngrade(rawContent, ctx) {
 // Core: prepare the request (returns a decode ctx if engaged, else null)
 // ---------------------------------------------------------------------------
 
-function prepareStructuredPrefill(body) {
+function prepareStructuredPrefill(body, tierOverride) {
     const s = getSettings();
     if (!s.structuredPrefillEnabled) return null;
     if (!Array.isArray(body.messages) || body.messages.length === 0) return null;
 
     const source = String(body.chat_completion_source || '');
     const model = String(body.model || '');
-    const bannedWords = parseBannedWords(s.spBannedWords);
+    // Banned words join the system instruction only when their own toggle is on.
+    const bannedWords = s.bannedWordsEnabled ? parseBannedWords(s.spBannedWords) : [];
 
     // Find the tail assistant message (the prefill), skipping trailing system.
     let tailIndex = body.messages.length - 1;
@@ -836,13 +898,16 @@ function prepareStructuredPrefill(body) {
     const tail = tailIndex >= 0 ? body.messages[tailIndex] : null;
     const hasPrefill = !!(tail && tail.role === 'assistant' && typeof tail.content === 'string' && tail.content.trim());
 
-    // Engage only when there's something to enforce.
-    if (!hasPrefill && bannedWords.length === 0) return null;
+    // The prefill machinery engages only when there IS a prefill; banned words
+    // without a prefill are handled by the standalone path (no JSON wrapping).
+    if (!hasPrefill) return null;
 
     // ── Resolve tier ──
     const sourceKey = `${source}|${model}`;
     let tier;
-    if (s.spMode === 'auto') {
+    if (tierOverride) {
+        tier = tierOverride;
+    } else if (s.spMode === 'auto') {
         tier = getCachedTier(sourceKey) || 'json_schema';
     } else {
         tier = s.spMode;
@@ -893,6 +958,11 @@ function prepareStructuredPrefill(body) {
         const minChars = mustEndAfterTemplate ? 0 : clampInt(s.spMinCharsAfterPrefix, 1, 10000, 80);
         const schema = buildJsonSchemaForPrefill(ctx, prefillTemplate, minChars, mustEndAfterTemplate);
         setResponseFormat(body, source, { type: 'json_schema', json_schema: schema });
+        // Banned words are not in the schema regex (lookaheads break grammar
+        // engines) — deliver them via instruction; enforcement backstops it.
+        if (bannedWords.length) {
+            prependSystemMessage(body, `Do NOT use any of the following words or phrases anywhere in your reply: ${bannedWords.join(', ')}.`);
+        }
     } else if (tier === 'json_object') {
         setResponseFormat(body, source, { type: 'json_object' });
         prependSystemMessage(body, buildSystemInstruction('json_object', ctx));
@@ -907,6 +977,49 @@ function prepareStructuredPrefill(body) {
 }
 
 // ---------------------------------------------------------------------------
+// Standalone banned words (no prefill / prefill disabled) — plain instruction,
+// NO JSON wrapping, so it can't break responses. Enforcement (if enabled) still
+// works because validation only inspects the returned text.
+// ---------------------------------------------------------------------------
+
+function buildBannedWordsInstruction(bannedWords) {
+    return `Do NOT use any of the following words or phrases anywhere in your reply: ${bannedWords.join(', ')}.`;
+}
+
+function prepareBannedWordsOnly(body) {
+    const s = getSettings();
+    if (!s.bannedWordsEnabled) return null;
+    const bannedWords = parseBannedWords(s.spBannedWords);
+    if (bannedWords.length === 0) return null;
+    if (!Array.isArray(body.messages) || body.messages.length === 0) return null;
+
+    prependSystemMessage(body, buildBannedWordsInstruction(bannedWords));
+
+    // Minimal ctx: plain mode — no unwrapping, no prefill stripping/validation.
+    const ctx = {
+        plain: true,
+        tier: 'plain',
+        sourceKey: `${String(body.chat_completion_source || '')}|${String(body.model || '')}`,
+        newlineToken: '',
+        bannedWords,
+        hidePrefill: false,
+        expectedPrefill: '',
+        hidePrefillLiteral: '',
+        hidePrefillRegex: null,
+        validatorPrefixRegex: null,
+    };
+
+    console.log(`${LOG_PREFIX} Engaged (banned words only): banned=${bannedWords.length}`);
+    return ctx;
+}
+
+// Dispatcher: prefill machinery first (when enabled and a prefill exists),
+// otherwise standalone banned words.
+function prepareRequest(body, tierOverride) {
+    return prepareStructuredPrefill(body, tierOverride) || prepareBannedWordsOnly(body);
+}
+
+// ---------------------------------------------------------------------------
 // Fetch interception
 // ---------------------------------------------------------------------------
 
@@ -915,7 +1028,8 @@ const previousFetch = window.fetch;
 async function interceptedFetch(input, init) {
     const url = typeof input === 'string' ? input : input?.url || '';
 
-    if (!getSettings()?.structuredPrefillEnabled ||
+    const s = getSettings();
+    if ((!s?.structuredPrefillEnabled && !s?.bannedWordsEnabled) ||
         !url.includes('/api/backends/chat-completions/generate') ||
         !init?.body) {
         return previousFetch(input, init);
@@ -930,7 +1044,7 @@ async function interceptedFetch(input, init) {
 
     let ctx;
     try {
-        ctx = prepareStructuredPrefill(body);
+        ctx = prepareRequest(body);
     } catch (err) {
         console.error(`${LOG_PREFIX} prepare failed, passing through:`, err);
         return previousFetch(input, init);
@@ -942,12 +1056,18 @@ async function interceptedFetch(input, init) {
 
     const isStreaming = body.stream === true;
 
+    // Standalone banned words without enforcement: instruction-only. The
+    // response needs no unwrapping/stripping — send and return untouched.
+    if (ctx.plain && !s.spValidateRetry) {
+        return previousFetch(input, { ...init, body: JSON.stringify(body) });
+    }
+
     // Enforcement path: buffer each attempt, validate, regenerate on violation.
     // This is the only provider-independent way to *force* compliance — it
     // depends on what we accept back, not on the API honouring response_format.
     if (getSettings().spValidateRetry) {
         try {
-            return await runEnforcedAttempts(input, init, body, ctx, isStreaming);
+            return await runEnforcedAttempts(input, init, init.body, body, ctx, isStreaming);
         } catch (err) {
             console.error(`${LOG_PREFIX} enforced attempts failed, passing through:`, err);
             return previousFetch(input, { ...init, body: JSON.stringify(body) });
@@ -1046,23 +1166,32 @@ const settingsHtml = `
     <input type="text" id="enh_sp_newline_token" class="text_pole" placeholder="\\n" />
 </div>
 
-<div class="flex-container flexFlowColumn marginTopBot5">
-    <label for="enh_sp_banned_words">Banned words / anti-slop (one per line)</label>
-    <textarea id="enh_sp_banned_words" class="text_pole" rows="4" placeholder="ozone&#10;Elara&#10;tapestry"></textarea>
-</div>
-<small class="textAlignCenter" style="display:block">
-    Words/phrases the model must never output. Enforced via regex on the
-    <code>json_schema</code> tier, and via a system instruction otherwise.
-    Banned words alone (no prefill) will anti-slop every generation.
-</small>
-
 <div class="flex-container marginTopBot5">
     <div id="enh_sp_reset_compat_btn" class="menu_button menu_button_icon" style="flex:1;">
         <i class="fa-solid fa-rotate-left"></i>
         <span>Reset Connection Compatibility</span>
     </div>
 </div>
-<small class="textAlignCenter" id="enh_sp_compat_status" style="display:block; opacity:0.75;"></small>`;
+<small class="textAlignCenter" id="enh_sp_compat_status" style="display:block; opacity:0.75;"></small>
+
+<hr>
+<h4>Banned Words (anti-slop)</h4>
+<div class="flex-container marginTopBot5">
+    <label class="checkbox_label" for="enh_bw_enabled">
+        <input type="checkbox" id="enh_bw_enabled" />
+        <span>Enable banned words</span>
+    </label>
+</div>
+<div class="flex-container flexFlowColumn marginTopBot5">
+    <label for="enh_sp_banned_words">Banned words / phrases (one per line)</label>
+    <textarea id="enh_sp_banned_words" class="text_pole" rows="4" placeholder="ozone&#10;Elara&#10;tapestry"></textarea>
+</div>
+<small class="textAlignCenter" style="display:block">
+    Works <b>independently</b> of Structured Prefill. On its own it uses a plain
+    system instruction — no JSON wrapping, so it can't break responses — plus
+    validate-and-regenerate when "Enforce compliance" is on. When Structured
+    Prefill is also active, the words are additionally baked into its schema.
+</small>`;
 
 const modeDescriptions = {
     auto: 'Tries json_schema first; on empty / non-JSON responses it downgrades and remembers the working mode per source + model.',
@@ -1081,6 +1210,11 @@ function updateModeDesc() {
 
 function ensureDefaults() {
     const s = getSettings();
+    // Migration: banned words used to ride the Structured Prefill toggle —
+    // keep them working for users who already had a list under SP.
+    if (s.bannedWordsEnabled === undefined && s.structuredPrefillEnabled && parseBannedWords(s.spBannedWords).length) {
+        s.bannedWordsEnabled = true;
+    }
     for (const [k, v] of Object.entries(defaultSettings)) {
         if (s[k] === undefined) s[k] = (v && typeof v === 'object') ? structuredClone(v) : v;
     }
@@ -1096,6 +1230,7 @@ function loadSettings() {
     $('#enh_sp_fewshot').prop('checked', !!s.spFewShot);
     $('#enh_sp_min_chars').val(s.spMinCharsAfterPrefix);
     $('#enh_sp_newline_token').val(s.spNewlineToken);
+    $('#enh_bw_enabled').prop('checked', !!s.bannedWordsEnabled);
     $('#enh_sp_banned_words').val(s.spBannedWords);
     updateModeDesc();
 }
@@ -1140,6 +1275,10 @@ export function init(contentContainer) {
     });
     $('#enh_sp_newline_token').on('change', function () {
         getSettings().spNewlineToken = String($(this).val()) || '\\n';
+        saveSettingsDebounced();
+    });
+    $('#enh_bw_enabled').on('change', function () {
+        getSettings().bannedWordsEnabled = $(this).is(':checked');
         saveSettingsDebounced();
     });
     $('#enh_sp_banned_words').on('input', function () {
