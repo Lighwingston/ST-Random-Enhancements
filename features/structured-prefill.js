@@ -206,13 +206,27 @@ function anyCharIncludingNewlineExpr() {
     return '[\\s\\S]';
 }
 
+// Lookarounds are rejected by every server-side pattern validator (OpenAI:
+// "regex lookaround is not supported") and by grammar engines. Never let one
+// into an outgoing schema pattern.
+function containsLookaround(regexText) {
+    return /\(\?<?[=!]/.test(String(regexText ?? ''));
+}
+
 function buildSlotRegex(slotContent) {
     const inner = String(slotContent ?? '').trim();
     if (!inner) return '(?:.*?)';
 
-    // [[re:...]] — raw regex passthrough
+    // [[re:...]] — raw regex passthrough (degraded if it uses lookarounds,
+    // which schema validators and grammar engines universally reject)
     const reMatch = /^re:\s*([\s\S]+)$/i.exec(inner);
-    if (reMatch) return reMatch[1];
+    if (reMatch) {
+        if (containsLookaround(reMatch[1])) {
+            console.warn(`${LOG_PREFIX} [[re:]] slot uses lookaround — replaced with a wildcard for schema compatibility.`);
+            return '(?:.*?)';
+        }
+        return reMatch[1];
+    }
 
     // [[name]] — name resolution not available client-side; match anything
     if (/^name$/i.test(inner)) return '(?:.*?)';
@@ -294,6 +308,14 @@ function buildJsonSchemaForPrefill(ctx, prefix, minCharsAfterPrefix, mustEndAfte
             ? `^(?:${prefixRegex})[\\t \\r\\n]*$`
             : `^(?:${prefixRegex})${anyChar}{${minChars},}$`;
         try { new RegExp(pattern); } catch { pattern = `^[\\s\\S]{${minChars},}$`; }
+    }
+
+    // Final guard: no lookarounds may ever reach the wire — server-side
+    // validators hard-reject the whole request ("regex lookaround is not
+    // supported") and grammar engines dead-end into empty replies.
+    if (containsLookaround(pattern)) {
+        console.warn(`${LOG_PREFIX} Built pattern still contained a lookaround — using minimal-safe fallback.`);
+        pattern = `^[\\s\\S]{${minChars},}$`;
     }
 
     return {
@@ -1074,8 +1096,20 @@ async function interceptedFetch(input, init) {
         }
     }
 
-    const modifiedInit = { ...init, body: JSON.stringify(body) };
-    const response = await previousFetch(input, modifiedInit);
+    let response = await previousFetch(input, { ...init, body: JSON.stringify(body) });
+
+    // A 4xx at a schema tier usually means the backend rejected our
+    // response_format (e.g. "regex lookaround is not supported", "pattern not
+    // permitted"). Downgrade a tier and retry instead of surfacing the error.
+    while (!response.ok && !ctx.plain
+        && response.status >= 400 && response.status < 500
+        && ctx.tier !== 'prompt_only') {
+        const rebuilt = rebuildAtWeakerTier(init.body, ctx);
+        if (!rebuilt) break;
+        console.warn(`${LOG_PREFIX} HTTP ${response.status} at tier ${ctx.tier} — downgrading to ${rebuilt.ctx.tier} and retrying.`);
+        ({ body, ctx } = rebuilt);
+        response = await previousFetch(input, { ...init, body: JSON.stringify(body) });
+    }
 
     if (!response.ok) return response;            // let ST handle errors
 
