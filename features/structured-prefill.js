@@ -17,7 +17,7 @@
  *     The last assistant message (your "Start Reply With" / prefill) is pulled
  *     out of the request and re-expressed as a constraint:
  *
- *        response_format: { type: 'json_schema', json_schema: { schema: {
+ *        json_schema: { name:'response', strict:true, value: { properties: {
  *          response: { type:'string', pattern: '^<prefill>...<min chars>$' }
  *        }}}
  *
@@ -34,23 +34,34 @@
  *     prefill message exists), banned words run STANDALONE via a plain system
  *     instruction — no JSON wrapping at all, so they can't break responses.
  *
- * Compatibility ladder (three tiers, same idea as the Spindle fork):
- *   json_schema  — full regex-locked structured output (real OpenAI / proxies)
- *   json_object  — JSON-shape only + system nudge (most OpenAI-compatible proxies)
- *   prompt_only  — no response_format, system instruction only (works anywhere)
+ * Compatibility ladder (three tiers):
+ *   json_schema  — shape + regex-locked pattern (real structured output)
+ *   json_object  — same JSON shape, no pattern lock, + system instruction
+ *   prompt_only  — no schema at all, system instruction only (works anywhere)
  *
  * In "auto" mode the strongest supported tier is tried, and if a response comes
  * back empty / not in our JSON shape (and isn't a model refusal), the tier is
  * downgraded and cached per source+model for subsequent generations.
  *
- * NOTE: response_format is injected via custom_include_body for the "custom"
- * (OpenAI-compatible) source — the only source guaranteed to forward arbitrary
- * body fields — and also set top-level as a best-effort for other sources.
- * Claude / Gemini sources fall back to the prompt_only tier automatically.
+ * DELIVERY (important): SillyTavern's backend does NOT forward an arbitrary
+ * top-level `response_format` — it rebuilds the upstream body from a fixed set
+ * of keys (see src/endpoints/backends/chat-completions.js). The only supported
+ * channel is the `json_schema: { name, strict, value }` request field, which ST
+ * translates into the provider's native structured-output parameter
+ * (`response_format` for OpenAI-likes, `responseSchema` for Gemini). That is
+ * what we use — which is why this now works on the plain OpenAI source and not
+ * just on "custom".
+ *
+ * Sources whose trailing assistant message is ALREADY a real prefill (Claude,
+ * DeepSeek, Moonshot) are left completely alone — the JSON trick would only
+ * make things worse there. Sources whose response shape we can't safely read
+ * (Cohere, AI21) are skipped as well, as are "continue" and quiet/background
+ * generations, whose trailing assistant message is not a prefill template.
  */
 
 import { extension_settings } from '../../../../extensions.js';
 import { saveSettingsDebounced } from '../../../../../script.js';
+import { eventSource, event_types } from '../../../../events.js';
 
 const SETTINGS_KEY = 'enhancements';
 const LOG_PREFIX = '[Enhancements:StructuredPrefill]';
@@ -68,12 +79,46 @@ const defaultSettings = {
     bannedWordsEnabled: false,    // banned words toggle — independent of the prefill
     spBannedWords: '',            // one banned word/phrase per line
     spCompatCache: {},            // { 'source|model': tier }  — auto-mode downgrade cache
+    spCompatVersion: 0,           // bumped when schema delivery changes → cache reset
     spValidateRetry: true,        // re-generate when output violates the prefill/banned constraints
     spMaxRetries: 2,              // max extra attempts before giving up and showing the last one
     spFewShot: false,             // inject a one-shot JSON-format demonstration (json_object/prompt_only)
 };
 
 const TIER_ORDER = ['json_schema', 'json_object', 'prompt_only'];
+
+// Bump whenever the way the schema reaches the provider changes: cached
+// "this tier doesn't work here" verdicts from older builds are then discarded.
+const COMPAT_CACHE_VERSION = 2;
+
+// ---------------------------------------------------------------------------
+// Generation type
+//
+// On "continue" (with Continue Prefill on) the trailing assistant message is
+// the message being extended, not a prefill template. Locking a schema onto it
+// would force the model to re-emit the whole message inside the JSON string —
+// a waste of the token budget with a good chance of truncation. Quiet prompts
+// (summaries, classifiers, /gen) are internal machinery and must not be
+// reshaped either. The type is consumed once so a stale value can never
+// silently disable the feature on the next message.
+// ---------------------------------------------------------------------------
+
+const SKIP_GENERATION_TYPES = new Set(['continue', 'quiet']);
+let pendingGenerationType = null;
+
+try {
+    eventSource.on(event_types.GENERATION_STARTED, (type) => {
+        pendingGenerationType = type ? String(type).toLowerCase() : '';
+    });
+} catch (err) {
+    console.warn(`${LOG_PREFIX} Could not subscribe to GENERATION_STARTED:`, err);
+}
+
+function takeGenerationType() {
+    const type = pendingGenerationType;
+    pendingGenerationType = null;
+    return type;
+}
 
 function nextTier(current) {
     const idx = TIER_ORDER.indexOf(current);
@@ -336,6 +381,33 @@ function buildJsonSchemaForPrefill(ctx, prefix, minCharsAfterPrefix, mustEndAfte
 // JSON extraction & unwrapping (handles streaming / unterminated strings)
 // ---------------------------------------------------------------------------
 
+const WRAPPER_KEY_RE = /"(?:response|value|content|prefix)"\s*:\s*"/;
+
+function stripLeadingFence(text) {
+    return String(text ?? '').replace(/^\s*```[a-zA-Z]*\s*/, '');
+}
+
+// True while the text so far is nothing but an opening code fence — "`", "``",
+// "```", "```json\n". Streaming must stay undecided here: what follows may be
+// either our JSON envelope or plain prose.
+function isFenceOnly(text) {
+    const s = String(text ?? '').trimStart();
+    if (!s) return false;
+    return /^`{1,2}$/.test(s) || /^```[a-zA-Z]*[ \t]*\n?$/.test(s);
+}
+
+// True when the text is (so far) nothing but our JSON envelope — `{`,
+// `{"resp`, `{"response": "` … Such a fragment carries no reply text and must
+// never be shown to the user as if the model had written it.
+function isWrapperScaffold(text) {
+    const s = stripLeadingFence(text).trimStart();
+    if (!s.startsWith('{')) return false;
+    if (WRAPPER_KEY_RE.test(s)) return true;
+    const got = s.slice(1).replace(/\s+/g, '');
+    return ['"response"', '"value"', '"content"', '"prefix"']
+        .some(k => k.startsWith(got.slice(0, k.length)) || got.startsWith(k));
+}
+
 function extractJsonStringField(rawText, fieldName, loose) {
     if (typeof rawText !== 'string' || rawText.length === 0) return null;
     const safeField = String(fieldName ?? '').replace(/[^a-zA-Z0-9_]/g, '');
@@ -475,16 +547,36 @@ function stripHidePrefill(text, ctx) {
 // Provider awareness
 // ---------------------------------------------------------------------------
 
-// Sources whose structured output isn't OpenAI-`response_format`-shaped. For
-// these we fall back to the universal prompt_only tier (system instruction).
+// Sources where a trailing assistant message is already forwarded as a genuine
+// prefill (Anthropic `assistant` continuation, DeepSeek `prefix`, Moonshot
+// `partial`). Wrapping those in JSON is strictly worse than doing nothing, so
+// the prefill machinery stays out of the way entirely.
+const NATIVE_PREFILL_SOURCES = new Set(['claude', 'anthropic', 'deepseek', 'moonshot']);
+
+// Which response shape ST hands back for a given source. We must be able to
+// both read the model text and re-emit it, otherwise we'd wipe the message.
+//   'openai' — choices[0].delta.content / choices[0].message.content
+//   'google' — candidates[0].content.parts[].text while streaming
+//              (ST re-wraps non-streaming Gemini replies into the OpenAI shape)
+//   null     — unsupported, leave the request untouched
+function responseShape(source) {
+    const s = String(source ?? '').toLowerCase();
+    if (!s) return 'openai';
+    if (s === 'makersuite' || s === 'google' || s === 'gemini' || s === 'vertexai') return 'google';
+    if (s === 'claude' || s === 'anthropic' || s === 'cohere' || s === 'ai21') return null;
+    return 'openai';
+}
+
+// Weakest tier a provider can realistically honour.
 function providerTierFloor(source, model) {
     const s = String(source ?? '').toLowerCase();
     const m = String(model ?? '').toLowerCase();
-    if (s === 'claude' || s === 'anthropic') return 'prompt_only';
-    if (s === 'makersuite' || s === 'google' || s === 'vertexai' || s === 'gemini') return 'prompt_only';
+    // Gemini takes the schema as `responseSchema`, which has no `pattern`
+    // support — shape-only is the strongest tier that works there.
+    if (s === 'makersuite' || s === 'google' || s === 'vertexai' || s === 'gemini') return 'json_object';
     if (s === 'openrouter') {
         if (m.includes('claude') || m.includes('anthropic') || m.includes('gemini') || m.startsWith('google/')) {
-            return 'prompt_only';
+            return 'json_object';
         }
     }
     return null;
@@ -496,11 +588,15 @@ function providerTierFloor(source, model) {
 
 function getCachedTier(sourceKey) {
     const cache = getSettings().spCompatCache || {};
-    return cache[sourceKey] || null;
+    const cached = cache[sourceKey];
+    // Only ever hand back a known tier — a stale/garbled entry must not become
+    // ctx.tier and silently disable every injection branch.
+    return TIER_ORDER.includes(cached) ? cached : null;
 }
 
 function setCachedTier(sourceKey, tier) {
     const s = getSettings();
+    if (!TIER_ORDER.includes(tier)) return;
     if (!s.spCompatCache) s.spCompatCache = {};
     if (s.spCompatCache[sourceKey] === tier) return;
     s.spCompatCache[sourceKey] = tier;
@@ -526,6 +622,11 @@ function buildSystemInstruction(tier, ctx) {
         ? `\n\nDo NOT use any of the following words or phrases anywhere in "response": ${ctx.bannedWords.join(', ')}.`
         : '';
 
+    if (tier === 'json_schema') {
+        // The grammar already forces the shape; this only tells the model *why*
+        // it is writing JSON, which measurably improves the prose inside it.
+        return `Write your entire reply as the "response" string of a single JSON object: {"response": "..."}. The reply itself must be complete and in-character — the JSON is only an envelope.${prefillClause}${banClause}`;
+    }
     if (tier === 'json_object') {
         return `You MUST respond with a JSON object of the form {"response": "your full reply as a single string"}. No other keys. No prose outside the JSON.${prefillClause}${banClause}`;
     }
@@ -537,19 +638,43 @@ function buildSystemInstruction(tier, ctx) {
 // Request body injection helpers
 // ---------------------------------------------------------------------------
 
-function setResponseFormat(body, source, formatObj) {
-    // Best-effort generic top-level field (forwarded by some sources).
-    body.response_format = formatObj;
-    // Guaranteed forwarding for the OpenAI-compatible "custom" source.
-    if (String(source).toLowerCase() === 'custom') {
-        const line = `response_format: ${JSON.stringify(formatObj)}`;
-        body.custom_include_body = line + '\n' + (body.custom_include_body || '');
-    }
+// ST rebuilds the upstream request from a fixed key list, so a top-level
+// `response_format` never leaves the server. `json_schema` is the one field it
+// translates into each provider's native structured-output parameter.
+function setJsonSchema(body, schema) {
+    body.json_schema = {
+        name: schema.name || 'response',
+        strict: schema.strict !== false,
+        value: schema.schema,
+    };
+}
+
+// Shape lock without a regex pattern — accepted by every backend that supports
+// structured output at all (including Gemini's responseSchema, which has no
+// `pattern` support).
+function buildShapeOnlySchema() {
+    return {
+        name: 'response',
+        strict: true,
+        schema: {
+            type: 'object',
+            properties: { response: { type: 'string' } },
+            required: ['response'],
+            additionalProperties: false,
+        },
+    };
 }
 
 function prependSystemMessage(body, content) {
     if (!Array.isArray(body.messages)) return;
     body.messages.unshift({ role: 'system', content });
+}
+
+// Format rules land at the very end of the prompt: instruction-following models
+// weight the last turn heaviest, and that is where the removed prefill was.
+function appendSystemMessage(body, content) {
+    if (!Array.isArray(body.messages)) return;
+    body.messages.push({ role: 'system', content });
 }
 
 // One-shot demonstration of the required JSON shape. Far more reliable than an
@@ -617,18 +742,93 @@ function buildRetryNudge(reason, ctx) {
     return 'Revise your previous reply so it satisfies all stated formatting constraints.';
 }
 
-// Pull the model text out of a non-streaming chat-completions JSON payload.
-function extractContentFromJson(json) {
-    const c = json?.choices?.[0]?.message?.content;
-    return typeof c === 'string' ? c : null;
+// ---------------------------------------------------------------------------
+// Response shape adapters
+// ---------------------------------------------------------------------------
+
+// Pull the model text out of a buffered (non-streaming) payload. ST normalises
+// Gemini replies into the OpenAI shape server-side, so one reader covers both;
+// non-string content (Mistral's part arrays) is reported as unreadable.
+// Some sources (MistralAI) return content as an array of blocks instead of a
+// string. Only the text blocks are reply text; `thinking` blocks are not.
+function contentBlocksToText(blocks) {
+    return blocks
+        .filter(b => b && typeof b.text === 'string' && !b.thinking)
+        .map(b => b.text)
+        .join('');
 }
 
-function buildSyntheticStreamResponse(display, upstream) {
+function extractContentFromJson(json) {
+    const c = json?.choices?.[0]?.message?.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return contentBlocksToText(c);
+    if (typeof json?.choices?.[0]?.text === 'string') return json.choices[0].text;
+    return null;
+}
+
+function extractFinishReason(json) {
+    return String(json?.choices?.[0]?.finish_reason ?? json?.candidates?.[0]?.finishReason ?? '');
+}
+
+// Was the reply cut off by the token budget rather than by the model finishing?
+// Reasoning models (gpt-5.x, o-series) burn the same budget on hidden thinking,
+// so a small "Max Response Length" routinely truncates the visible answer — and
+// with a JSON wrapper that can leave nothing but `{"response": "` behind.
+function isTruncated(json) {
+    const r = extractFinishReason(json).toLowerCase();
+    return r === 'length' || r === 'max_tokens';
+}
+
+// Read the incremental text out of one parsed SSE chunk.
+function streamDeltaText(chunk, shape) {
+    if (shape === 'google') {
+        const parts = chunk?.candidates?.[0]?.content?.parts;
+        if (!Array.isArray(parts)) return '';
+        return parts.filter(p => !p.thought && typeof p.text === 'string').map(p => p.text).join('');
+    }
+    const delta = chunk?.choices?.[0]?.delta;
+    if (delta && typeof delta.content === 'string') return delta.content;
+    // Mistral-style content blocks: [{ type:'text', text:'…' }, { thinking:[…] }]
+    if (Array.isArray(delta?.content)) return contentBlocksToText(delta.content);
+    if (typeof chunk?.choices?.[0]?.message?.content === 'string') return chunk.choices[0].message.content;
+    if (Array.isArray(chunk?.choices?.[0]?.message?.content)) return contentBlocksToText(chunk.choices[0].message.content);
+    if (typeof chunk?.choices?.[0]?.text === 'string') return chunk.choices[0].text;
+    return '';
+}
+
+// Does this chunk carry reasoning/thinking only? Those deltas must not be
+// folded into the JSON body we are trying to parse, but they must still reach
+// SillyTavern untouched so the reasoning UI keeps working.
+function isSideChannelChunk(chunk, shape) {
+    if (streamDeltaText(chunk, shape)) return false;
+    if (shape === 'google') {
+        const parts = chunk?.candidates?.[0]?.content?.parts;
+        return Array.isArray(parts) && parts.some(p => p.thought || p.inlineData || p.thoughtSignature);
+    }
+    const d = chunk?.choices?.[0]?.delta ?? {};
+    return typeof d.reasoning === 'string' || typeof d.reasoning_content === 'string'
+        || Array.isArray(d.reasoning_details) || Array.isArray(d.images);
+}
+
+function buildSseChunk(deltaContent, finish, shape) {
+    if (shape === 'google') {
+        const payload = finish
+            ? { candidates: [{ content: { parts: [{ text: '' }], role: 'model' }, finishReason: 'STOP' }] }
+            : { candidates: [{ content: { parts: [{ text: deltaContent }], role: 'model' } }] };
+        return `data: ${JSON.stringify(payload)}\n\n`;
+    }
+    const choice = finish
+        ? { index: 0, delta: {}, finish_reason: 'stop' }
+        : { index: 0, delta: { content: deltaContent }, finish_reason: null };
+    return `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [choice] })}\n\n`;
+}
+
+function buildSyntheticStreamResponse(display, upstream, shape) {
     const enc = new TextEncoder();
     const stream = new ReadableStream({
         start(ctl) {
-            if (display) ctl.enqueue(enc.encode(buildSseChunk(display, false)));
-            ctl.enqueue(enc.encode(buildSseChunk('', true)));
+            if (display) ctl.enqueue(enc.encode(buildSseChunk(display, false, shape)));
+            ctl.enqueue(enc.encode(buildSseChunk('', true, shape)));
             ctl.enqueue(enc.encode('data: [DONE]\n\n'));
             ctl.close();
         },
@@ -644,6 +844,7 @@ function buildSyntheticStreamResponse(display, upstream) {
 
 function buildJsonResponse(display, json, upstream) {
     if (json?.choices?.[0]?.message) json.choices[0].message.content = display;
+    else if (json?.choices?.[0] && typeof json.choices[0].text === 'string') json.choices[0].text = display;
     return new Response(JSON.stringify(json), {
         status: upstream?.status ?? 200,
         statusText: upstream?.statusText ?? 'OK',
@@ -717,14 +918,36 @@ async function runEnforcedAttempts(input, init, originalRawBody, body, ctx, orig
         lastUpstream = upstream;
 
         const rawContent = extractContentFromJson(json) ?? '';
+        const truncated = isTruncated(json);
         // Plain (banned-words-only) mode has no JSON wrapper to unwrap.
-        const unwrapped = ctx.plain ? null : tryUnwrapStructuredOutput(rawContent, ctx);
+        let unwrapped = ctx.plain ? null : tryUnwrapStructuredOutput(rawContent, ctx);
+        // A wrapper that was cut off before its value opened (`{"response": "`)
+        // must never be shown as if the model had said it.
+        const scaffoldOnly = unwrapped === null && !ctx.plain && isWrapperScaffold(rawContent);
+        if (scaffoldOnly) unwrapped = '';
         const finalText = (unwrapped !== null) ? unwrapped : rawContent;
 
         acceptedRaw = rawContent;
         acceptedDisplay = stripHidePrefill(finalText, ctx);
 
         const verdict = validateOutput(finalText, ctx);
+
+        // Cut off by the token budget, not by the model refusing to comply.
+        // Reasoning models spend the same budget on hidden thinking, so this is
+        // the normal failure mode of a small "Max Response Length". Retrying or
+        // downgrading only burns more tokens on the same wall.
+        if (truncated && !verdict.ok) {
+            console.warn(`${LOG_PREFIX} Reply truncated by the token limit (${verdict.reason}) — accepting as-is.`);
+            try {
+                window.toastr?.warning(
+                    finalText.trim().length === 0
+                        ? 'Structured Prefill: the model used its whole token budget before writing anything. Raise "Max Response Length" (reasoning models spend it on thinking).'
+                        : 'Structured Prefill: reply hit the token limit and was cut short. Raise "Max Response Length".',
+                    'Enhancements', { timeOut: 9000 },
+                );
+            } catch { /* ignore */ }
+            break;
+        }
 
         // Empty or JSON-shaped-but-unparseable output at a schema tier =
         // constrained decoding dead-ended. Nudging can't fix that; downgrade.
@@ -759,54 +982,105 @@ async function runEnforcedAttempts(input, init, originalRawBody, body, ctx, orig
         body.messages.push({ role: 'system', content: buildRetryNudge(verdict.reason, ctx) });
     }
 
-    try { evaluateAndMaybeDowngrade(acceptedRaw, ctx); } catch { /* ignore */ }
+    try { evaluateAndMaybeDowngrade(acceptedRaw, ctx, lastJson); } catch { /* ignore */ }
 
     return originalStreaming
-        ? buildSyntheticStreamResponse(acceptedDisplay, lastUpstream)
+        ? buildSyntheticStreamResponse(acceptedDisplay, lastUpstream, ctx.shape)
         : buildJsonResponse(acceptedDisplay, lastJson, lastUpstream);
 }
 
 // ---------------------------------------------------------------------------
 // Streaming response transform — unwrap JSON deltas into clean text
+//
+// SillyTavern *accumulates* streamed deltas (text += delta), so everything we
+// emit is final: there is no way to retract a character once it is out. The
+// transform therefore never emits anything it might have to take back.
+//
+// Three states:
+//   'undecided' — buffer silently until we know whether this reply is our JSON
+//                 wrapper or plain prose
+//   'json'      — emit only the unwrapped (and prefill-stripped) value
+//   'raw'       — the model ignored the format; stream its text verbatim
+//
+// The previous implementation emitted the raw `{"response": "` scaffolding as
+// soon as it arrived, and from then on every real display update failed its
+// `startsWith(lastDisplay)` guard — so the message froze at `{"response": "`
+// for the rest of the generation. That is the bug this rewrite removes.
 // ---------------------------------------------------------------------------
 
-function buildSseChunk(deltaContent, finish) {
-    const choice = finish
-        ? { index: 0, delta: {}, finish_reason: 'stop' }
-        : { index: 0, delta: { content: deltaContent }, finish_reason: null };
-    return `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [choice] })}\n\n`;
-}
-
 function createUnwrapStreamTransform(ctx, onComplete) {
+    const shape = ctx.shape || 'openai';
     let rawContent = '';
     let lastDisplay = '';
     let buf = '';
+    let mode = 'undecided';
     let finished = false;
     const enc = new TextEncoder();
     const dec = new TextDecoder();
 
-    function recomputeDisplay() {
-        const unwrapped = tryUnwrapStructuredOutput(rawContent, ctx);
-        return (unwrapped !== null) ? stripHidePrefill(unwrapped, ctx) : rawContent;
+    function emit(ctl, text) {
+        if (!text) return;
+        ctl.enqueue(enc.encode(buildSseChunk(text, false, shape)));
     }
 
-    function emitProgress(ctl) {
-        const display = recomputeDisplay();
+    // Emit the part of `display` we haven't sent yet, but only while it stays a
+    // strict extension of what is already on screen.
+    function push(ctl, display) {
         if (display.length > lastDisplay.length && display.startsWith(lastDisplay)) {
-            ctl.enqueue(enc.encode(buildSseChunk(display.slice(lastDisplay.length), false)));
+            emit(ctl, display.slice(lastDisplay.length));
             lastDisplay = display;
         }
+    }
+
+    // With "hide prefill" on we must not emit the prefill and then try to
+    // remove it. Hold back until the stripper has actually engaged (or until
+    // the model has clearly deviated from the prefill).
+    function displayFor(unwrapped, final) {
+        if (!ctx.hidePrefill) return unwrapped;
+        const stripped = stripHidePrefill(unwrapped, ctx);
+        if (stripped !== unwrapped) return stripped;          // strip engaged
+        if (final) return stripped;                            // nothing left to wait for
+        // A templated prefill ([[any]], [[re:…]], …) only becomes strippable once
+        // its closing literal arrives, and its real length is unknown in advance.
+        // Emitting early would leak the prefill and then freeze the message,
+        // because the corrected text is not an extension of it.
+        if (ctx.hidePrefillRegex) return lastDisplay;
+        const literal = ctx.hidePrefillLiteral || '';
+        if (literal && (literal.startsWith(unwrapped) || unwrapped.length < literal.length)) return lastDisplay;
+        return stripped;
+    }
+
+    function decideMode() {
+        if (mode !== 'undecided') return;
+        if (!rawContent.trim()) return;
+        if (isFenceOnly(rawContent)) return;                   // wait for the body
+        if (WRAPPER_KEY_RE.test(rawContent)) { mode = 'json'; return; }
+        if (!isWrapperScaffold(rawContent)) mode = 'raw';
+    }
+
+    function progress(ctl, final) {
+        decideMode();
+        if (mode === 'raw') { push(ctl, rawContent); return; }
+        if (mode === 'json') {
+            const unwrapped = tryUnwrapStructuredOutput(rawContent, ctx);
+            if (unwrapped === null) return;                    // value not open yet
+            push(ctl, displayFor(unwrapped, final));
+            return;
+        }
+        if (!final) return;                                    // still undecided
+        // End of stream and we never resolved: prefer the unwrapped value,
+        // otherwise fall back to the raw text — but never leak scaffolding.
+        const unwrapped = tryUnwrapStructuredOutput(rawContent, ctx);
+        if (unwrapped !== null) push(ctl, displayFor(unwrapped, true));
+        else if (!isWrapperScaffold(rawContent) && !isFenceOnly(rawContent)) push(ctl, rawContent);
+        else console.warn(`${LOG_PREFIX} Stream ended on an empty JSON wrapper — nothing to show (token limit?).`);
     }
 
     function finalize(ctl) {
         if (finished) return;
         finished = true;
-        const display = recomputeDisplay();
-        if (display.length > lastDisplay.length && display.startsWith(lastDisplay)) {
-            ctl.enqueue(enc.encode(buildSseChunk(display.slice(lastDisplay.length), false)));
-            lastDisplay = display;
-        }
-        ctl.enqueue(enc.encode(buildSseChunk('', true)));
+        progress(ctl, true);
+        ctl.enqueue(enc.encode(buildSseChunk('', true, shape)));
         ctl.enqueue(enc.encode('data: [DONE]\n\n'));
         try { onComplete?.(rawContent); } catch { /* ignore */ }
     }
@@ -820,18 +1094,18 @@ function createUnwrapStreamTransform(ctx, onComplete) {
                 if (!line.startsWith('data:')) continue; // drop comments / blanks
                 const payload = line.slice(5).trim();
                 if (payload === '[DONE]') { finalize(ctl); continue; }
-                try {
-                    const d = JSON.parse(payload);
-                    const delta = d.choices?.[0]?.delta;
-                    // Skip reasoning/CoT deltas — they aren't part of the JSON body.
-                    if (delta && typeof delta.content === 'string') {
-                        rawContent += delta.content;
-                        emitProgress(ctl);
-                    } else if (typeof d.choices?.[0]?.message?.content === 'string') {
-                        rawContent += d.choices[0].message.content;
-                        emitProgress(ctl);
-                    }
-                } catch { /* skip malformed line */ }
+                let d;
+                try { d = JSON.parse(payload); } catch { continue; }
+                // Reasoning / image / signature chunks carry no reply text but
+                // SillyTavern still needs them — forward untouched.
+                if (isSideChannelChunk(d, shape)) {
+                    ctl.enqueue(enc.encode(`data: ${payload}\n\n`));
+                    continue;
+                }
+                const text = streamDeltaText(d, shape);
+                if (!text) continue;
+                rawContent += text;
+                progress(ctl, false);
             }
         },
         flush(ctl) {
@@ -853,13 +1127,15 @@ async function wrapNonStreamingResponse(response, ctx, onComplete) {
         return clone;
     }
 
-    const content = json?.choices?.[0]?.message?.content;
+    const content = extractContentFromJson(json);
     if (typeof content === 'string') {
-        const unwrapped = tryUnwrapStructuredOutput(content, ctx);
+        let unwrapped = tryUnwrapStructuredOutput(content, ctx);
+        if (unwrapped === null && isWrapperScaffold(content)) unwrapped = '';
         const finalText = (unwrapped !== null) ? unwrapped : content;
         const display = stripHidePrefill(finalText, ctx);
-        json.choices[0].message.content = display;
-        try { onComplete?.(content); } catch { /* ignore */ }
+        if (json?.choices?.[0]?.message) json.choices[0].message.content = display;
+        else if (json?.choices?.[0]) json.choices[0].text = display;
+        try { onComplete?.(content, json); } catch { /* ignore */ }
     }
 
     return new Response(JSON.stringify(json), {
@@ -873,13 +1149,16 @@ async function wrapNonStreamingResponse(response, ctx, onComplete) {
 // Auto-mode tier evaluation (downgrade on failure)
 // ---------------------------------------------------------------------------
 
-function evaluateAndMaybeDowngrade(rawContent, ctx) {
+function evaluateAndMaybeDowngrade(rawContent, ctx, json) {
     const s = getSettings();
     if (s.spMode !== 'auto') return;                 // only auto mode self-tunes
     if (ctx.tier !== 'json_schema' && ctx.tier !== 'json_object') return;
+    // A reply cut off by the token budget says nothing about schema support.
+    if (json && isTruncated(json)) return;
 
     const empty = !rawContent || String(rawContent).trim().length === 0;
-    const ourJson = tryUnwrapStructuredOutput(rawContent, ctx) !== null;
+    const ourJson = tryUnwrapStructuredOutput(rawContent, ctx) !== null
+        || isWrapperScaffold(rawContent);
     const refusal = looksLikeModelRefusal(rawContent);
 
     if (empty || (!ourJson && !refusal)) {
@@ -906,8 +1185,16 @@ function evaluateAndMaybeDowngrade(rawContent, ctx) {
 
 function prepareStructuredPrefill(body, tierOverride) {
     const s = getSettings();
+    const generationType = tierOverride ? '' : takeGenerationType();
     if (!s.structuredPrefillEnabled) return null;
     if (!Array.isArray(body.messages) || body.messages.length === 0) return null;
+    // Another extension already asked for structured output on this call
+    // (expression classifier, summarizer, …) — never fight over the field.
+    if (body.json_schema) return null;
+    if (SKIP_GENERATION_TYPES.has(generationType)) {
+        console.log(`${LOG_PREFIX} Skipped: "${generationType}" generation.`);
+        return null;
+    }
 
     const source = String(body.chat_completion_source || '');
     const model = String(body.model || '');
@@ -924,6 +1211,22 @@ function prepareStructuredPrefill(body, tierOverride) {
     // without a prefill are handled by the standalone path (no JSON wrapping).
     if (!hasPrefill) return null;
 
+    // These backends forward the trailing assistant message as a real prefill,
+    // so the model already continues it verbatim. Emulating that with JSON would
+    // only cost tokens and mangle the reply.
+    if (NATIVE_PREFILL_SOURCES.has(source.toLowerCase())) {
+        console.log(`${LOG_PREFIX} Skipped: "${source}" supports assistant prefill natively.`);
+        return null;
+    }
+
+    // We rewrite the reply on the way back; if we can't read that source's shape
+    // we would blank the message instead.
+    const shape = responseShape(source);
+    if (!shape) {
+        console.log(`${LOG_PREFIX} Skipped: response shape of "${source}" is not supported.`);
+        return null;
+    }
+
     // ── Resolve tier ──
     const sourceKey = `${source}|${model}`;
     let tier;
@@ -938,24 +1241,19 @@ function prepareStructuredPrefill(body, tierOverride) {
     if (floor) tier = weakerOf(tier, floor);
 
     // ── Build the prefill template ──
-    let prefillTemplate = '';
-    let mustEndAfterTemplate = false;
-
-    if (hasPrefill) {
-        prefillTemplate = String(tail.content);
-        // Remove the assistant prefill from the outgoing messages.
-        body.messages.splice(tailIndex, 1);
-        // Quote-harden then split off the [[end]] marker.
-        prefillTemplate = curlyQuoteLiteralsOutsideSlots(prefillTemplate);
-        const endSplit = splitEndPrefillTemplate(prefillTemplate);
-        prefillTemplate = endSplit.template;
-        mustEndAfterTemplate = endSplit.hasEndMarker;
-    }
+    let prefillTemplate = String(tail.content);
+    // Remove the assistant prefill from the outgoing messages.
+    body.messages.splice(tailIndex, 1);
+    // Quote-harden then split off the [[end]] marker.
+    prefillTemplate = curlyQuoteLiteralsOutsideSlots(prefillTemplate);
+    const endSplit = splitEndPrefillTemplate(prefillTemplate);
+    prefillTemplate = endSplit.template;
+    const mustEndAfterTemplate = endSplit.hasEndMarker;
 
     // Many providers reject a request whose last message is assistant-role.
     if (body.messages.length > 0 && body.messages[body.messages.length - 1]?.role === 'assistant') {
         // Re-insert prefill so we don't break the request, then bail out.
-        if (hasPrefill) body.messages.splice(tailIndex, 0, tail);
+        body.messages.splice(tailIndex, 0, tail);
         return null;
     }
 
@@ -964,6 +1262,7 @@ function prepareStructuredPrefill(body, tierOverride) {
     // Decode context carried into the response transform.
     const ctx = {
         tier,
+        shape,
         sourceKey,
         newlineToken,
         bannedWords,
@@ -971,6 +1270,7 @@ function prepareStructuredPrefill(body, tierOverride) {
         expectedPrefill: straightenCurlyQuotes(prefillTemplate),
         hidePrefillLiteral: '',
         hidePrefillRegex: null,
+        grammarLocked: false,
     };
     if (ctx.hidePrefill) buildPrefillStripper(ctx, straightenCurlyQuotes(prefillTemplate));
     buildEnforcementValidator(ctx);
@@ -979,18 +1279,19 @@ function prepareStructuredPrefill(body, tierOverride) {
     if (tier === 'json_schema') {
         const minChars = mustEndAfterTemplate ? 0 : clampInt(s.spMinCharsAfterPrefix, 1, 10000, 80);
         const schema = buildJsonSchemaForPrefill(ctx, prefillTemplate, minChars, mustEndAfterTemplate);
-        setResponseFormat(body, source, { type: 'json_schema', json_schema: schema });
+        setJsonSchema(body, schema);
+        ctx.grammarLocked = true;
         // Banned words are not in the schema regex (lookaheads break grammar
         // engines) — deliver them via instruction; enforcement backstops it.
-        if (bannedWords.length) {
-            prependSystemMessage(body, `Do NOT use any of the following words or phrases anywhere in your reply: ${bannedWords.join(', ')}.`);
-        }
+        appendSystemMessage(body, buildSystemInstruction('json_schema', ctx));
     } else if (tier === 'json_object') {
-        setResponseFormat(body, source, { type: 'json_object' });
-        prependSystemMessage(body, buildSystemInstruction('json_object', ctx));
+        // `{type:'json_object'}` can't be delivered through ST, and a shape-only
+        // schema is a strict upgrade over it anyway: same guarantee, no pattern.
+        setJsonSchema(body, buildShapeOnlySchema());
+        appendSystemMessage(body, buildSystemInstruction('json_object', ctx));
         if (s.spFewShot) prependMessages(body, buildFewShotMessages(ctx));
     } else {
-        prependSystemMessage(body, buildSystemInstruction('prompt_only', ctx));
+        appendSystemMessage(body, buildSystemInstruction('prompt_only', ctx));
         if (s.spFewShot) prependMessages(body, buildFewShotMessages(ctx));
     }
 
@@ -1015,12 +1316,18 @@ function prepareBannedWordsOnly(body) {
     if (bannedWords.length === 0) return null;
     if (!Array.isArray(body.messages) || body.messages.length === 0) return null;
 
-    prependSystemMessage(body, buildBannedWordsInstruction(bannedWords));
+    // Keep the instruction away from the tail when the tail is a prefill we are
+    // deliberately not touching (native-prefill sources) — a system message
+    // after an assistant prefill breaks the continuation.
+    const last = body.messages[body.messages.length - 1];
+    if (last?.role === 'assistant') prependSystemMessage(body, buildBannedWordsInstruction(bannedWords));
+    else appendSystemMessage(body, buildBannedWordsInstruction(bannedWords));
 
     // Minimal ctx: plain mode — no unwrapping, no prefill stripping/validation.
     const ctx = {
         plain: true,
         tier: 'plain',
+        shape: responseShape(body.chat_completion_source),
         sourceKey: `${String(body.chat_completion_source || '')}|${String(body.model || '')}`,
         newlineToken: '',
         bannedWords,
@@ -1039,6 +1346,18 @@ function prepareBannedWordsOnly(body) {
 // otherwise standalone banned words.
 function prepareRequest(body, tierOverride) {
     return prepareStructuredPrefill(body, tierOverride) || prepareBannedWordsOnly(body);
+}
+
+// Buffering (upstream forced to non-streaming so each attempt can be inspected)
+// is what makes validate-and-retry possible, but it also hides live streaming
+// from the user. Skip it when it buys nothing: a grammar-locked schema that this
+// connection has already honoured cannot produce a non-compliant prefix.
+function needsBuffering(ctx, s) {
+    if (!s.spValidateRetry) return false;
+    if (!ctx.shape) return false;                       // can't read it — don't touch it
+    if (ctx.bannedWords?.length) return true;           // only a client-side check enforces these
+    if (ctx.plain) return false;                        // instruction-only, nothing to verify
+    return !(ctx.grammarLocked && getCachedTier(ctx.sourceKey) === 'json_schema');
 }
 
 // ---------------------------------------------------------------------------
@@ -1078,16 +1397,17 @@ async function interceptedFetch(input, init) {
 
     const isStreaming = body.stream === true;
 
-    // Standalone banned words without enforcement: instruction-only. The
-    // response needs no unwrapping/stripping — send and return untouched.
-    if (ctx.plain && !s.spValidateRetry) {
+    // Nothing to rewrite on the way back: send the modified prompt and let the
+    // response through untouched (banned words without enforcement, and any
+    // source whose shape we don't rewrite).
+    if (ctx.plain && !needsBuffering(ctx, s)) {
         return previousFetch(input, { ...init, body: JSON.stringify(body) });
     }
 
     // Enforcement path: buffer each attempt, validate, regenerate on violation.
     // This is the only provider-independent way to *force* compliance — it
-    // depends on what we accept back, not on the API honouring response_format.
-    if (getSettings().spValidateRetry) {
+    // depends on what we accept back, not on the API honouring the schema.
+    if (needsBuffering(ctx, s)) {
         try {
             return await runEnforcedAttempts(input, init, init.body, body, ctx, isStreaming);
         } catch (err) {
@@ -1098,9 +1418,10 @@ async function interceptedFetch(input, init) {
 
     let response = await previousFetch(input, { ...init, body: JSON.stringify(body) });
 
-    // A 4xx at a schema tier usually means the backend rejected our
-    // response_format (e.g. "regex lookaround is not supported", "pattern not
-    // permitted"). Downgrade a tier and retry instead of surfacing the error.
+    // A 4xx at a schema tier usually means the backend rejected our schema
+    // (e.g. "regex lookaround is not supported", "pattern not permitted", or a
+    // model that predates structured outputs). Downgrade and retry instead of
+    // surfacing the error.
     while (!response.ok && !ctx.plain
         && response.status >= 400 && response.status < 500
         && ctx.tier !== 'prompt_only') {
@@ -1122,7 +1443,7 @@ async function interceptedFetch(input, init) {
         });
     }
 
-    return wrapNonStreamingResponse(response, ctx, (raw) => evaluateAndMaybeDowngrade(raw, ctx));
+    return wrapNonStreamingResponse(response, ctx, (raw, json) => evaluateAndMaybeDowngrade(raw, ctx, json));
 }
 
 window.fetch = interceptedFetch;
@@ -1142,18 +1463,18 @@ const settingsHtml = `
 </div>
 <small class="textAlignCenter" style="display:block">
     Forces the model to begin its reply with your <b>Start Reply With</b> /
-    last assistant prefill by wrapping it in a JSON <code>response_format</code>
-    constraint, then strips the JSON wrapper before display. Works best with the
-    OpenAI-compatible <b>Custom</b> source; Claude / Gemini fall back to a
-    prompt-only instruction automatically.
+    last assistant prefill by wrapping it in a JSON schema constraint, then
+    strips the JSON wrapper before display. Claude / DeepSeek / Moonshot are
+    skipped automatically — they honour a real assistant prefill already, as are
+    <i>Continue</i> and background generations (summaries, classifiers).
 </small>
 
 <div class="flex-container flexFlowColumn marginTopBot5">
     <label for="enh_sp_mode">Structured output mode</label>
     <select id="enh_sp_mode" class="text_pole">
         <option value="auto">Auto-detect (probe &amp; cache strongest)</option>
-        <option value="json_schema">json_schema — regex-locked (real OpenAI / proxies)</option>
-        <option value="json_object">json_object — shape only (most proxies)</option>
+        <option value="json_schema">json_schema — regex-locked (OpenAI &amp; schema-honouring proxies)</option>
+        <option value="json_object">Shape only — JSON schema without the regex lock</option>
         <option value="prompt_only">Prompt only — instruction (works anywhere, weakest)</option>
     </select>
 </div>
@@ -1175,7 +1496,10 @@ const settingsHtml = `
 <small class="textAlignCenter" style="display:block">
     The only provider-independent way to actually <b>force</b> the prefill /
     banned-word rules: each reply is checked client-side and regenerated if it
-    breaks them. Costs extra tokens &amp; latency per retry. Refusals are not retried.
+    breaks them. Costs extra tokens &amp; latency per retry, and <b>disables live
+    streaming</b> (the reply has to be complete before it can be checked).
+    Skipped automatically once a connection is known to honour the regex lock.
+    Refusals are not retried.
 </small>
 
 <div class="flex-container flexFlowColumn marginTopBot5">
@@ -1229,9 +1553,9 @@ const settingsHtml = `
 
 const modeDescriptions = {
     auto: 'Tries json_schema first; on empty / non-JSON responses it downgrades and remembers the working mode per source + model.',
-    json_schema: 'Strongest. Byte-for-byte regex lock on the response. Only real OpenAI and schema-honouring proxies support this.',
-    json_object: 'Model must emit a JSON object; the prefill is enforced via a system instruction. Works on most OpenAI-compatible proxies.',
-    prompt_only: 'No response_format sent — only a system instruction. Universal but weakest; relies on model compliance.',
+    json_schema: 'Strongest. Regex lock on the reply, delivered as a real structured-output schema. Needs a backend that supports string patterns (OpenAI does).',
+    json_object: 'Locks the JSON shape but not its contents; the prefill rides a system instruction. Works wherever structured output exists at all, including Gemini.',
+    prompt_only: 'No schema sent — only a system instruction. Universal but weakest; relies on model compliance.',
 };
 
 // ---------------------------------------------------------------------------
@@ -1248,6 +1572,17 @@ function ensureDefaults() {
     // keep them working for users who already had a list under SP.
     if (s.bannedWordsEnabled === undefined && s.structuredPrefillEnabled && parseBannedWords(s.spBannedWords).length) {
         s.bannedWordsEnabled = true;
+    }
+    // Migration: earlier builds sent the schema in a field SillyTavern strips
+    // before calling the provider, so json_schema "failed" on every connection
+    // and got cached as unsupported. Those verdicts are meaningless now — drop
+    // them once so the ladder re-probes from the top.
+    if (s.spCompatVersion !== COMPAT_CACHE_VERSION) {
+        if (s.spCompatCache && Object.keys(s.spCompatCache).length) {
+            console.log(`${LOG_PREFIX} Schema delivery changed — clearing stale compatibility cache.`);
+        }
+        s.spCompatCache = {};
+        s.spCompatVersion = COMPAT_CACHE_VERSION;
     }
     for (const [k, v] of Object.entries(defaultSettings)) {
         if (s[k] === undefined) s[k] = (v && typeof v === 'object') ? structuredClone(v) : v;
