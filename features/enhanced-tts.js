@@ -315,14 +315,14 @@ function setButtonState($btn, state, label, badge) {
     if (state === 'error') $btn.addClass('enh_tts_error');
     if (label !== undefined) $btn.attr('title', label);
 
-    // Visible progress badge sits right after the button so the user can watch
+    // Visible progress badge lives inside the button so the user can watch
     // generation advance without hovering for the tooltip.
-    const $badge = $btn.siblings('.enh_tts_progress').first();
+    const $badge = $btn.find('.enh_tts_progress').first();
     if ($badge.length === 0) return;
     if (badge === undefined || badge === null || badge === '') {
         $badge.hide().text('');
     } else {
-        $badge.text(badge).toggleClass('enh_tts_progress_wait', state === 'busy' && /wait/i.test(String(badge))).show();
+        $badge.text(badge).toggleClass('enh_tts_progress_wait', state === 'busy' && /wait|retry/i.test(String(badge))).show();
     }
 }
 
@@ -333,14 +333,18 @@ function setButtonState($btn, state, label, badge) {
 function ensureReplayButton(messageId) {
     const $mes = getMessageEl(messageId);
     if ($mes.length === 0) return;
-    const $row = $mes.find('.extraMesButtons').first();
-    if ($row.length === 0 || $row.find('.enh_tts_replay').length) return;
+    // Anchor in the always-visible name row, NOT in .extraMesButtons — that row
+    // is collapsed behind the "⋯" Message Actions hint and is display:none by
+    // default (and on mobile), so a progress badge placed there stays invisible
+    // until the user manually expands the menu.
+    const $anchor = $mes.find('.ch_name .flex-container.flex1').first();
+    if ($anchor.length === 0 || $anchor.find('.enh_tts_replay').length) return;
     const $btn = $(
-        '<div class="mes_button enh_tts_replay fa-solid fa-wave-square" ' +
-        'title="Play narrated audio" tabindex="0"></div>');
-    const $badge = $('<span class="enh_tts_progress" style="display:none"></span>');
-    $row.prepend($badge);
-    $row.prepend($btn);
+        '<div class="enh_tts_replay" title="Play narrated audio" role="button" tabindex="0">' +
+        '<i class="enh_tts_icon fa-solid fa-wave-square"></i>' +
+        '<span class="enh_tts_progress" style="display:none"></span>' +
+        '</div>');
+    $anchor.append($btn);
 }
 
 /** Format a progress badge like "3/8" or "waiting 12s". */
@@ -818,31 +822,45 @@ function injectStyles() {
     if (stylesInjected) return;
     stylesInjected = true;
     const css = `
+.enh_tts_replay {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    margin-left: 8px;
+    cursor: pointer;
+    vertical-align: middle;
+    opacity: 0.8;
+    transition: opacity var(--animation-duration-2x, 0.2s) ease-in-out;
+}
+.enh_tts_replay:hover { opacity: 1; }
+.enh_tts_icon {
+    filter: drop-shadow(0px 0px 2px black);
+    font-size: 0.95em;
+}
+.enh_tts_replay.enh_tts_busy .enh_tts_icon { color: #c8a24a; }
+.enh_tts_replay.enh_tts_error .enh_tts_icon { color: #c0392b; }
+.enh_tts_replay.enh_tts_ready .enh_tts_icon { color: inherit; }
 .enh_tts_progress {
     display: inline-flex;
     align-items: center;
-    margin-left: 4px;
     padding: 0 6px;
-    height: 1.4em;
+    height: 1.5em;
     border-radius: 8px;
-    font-size: 0.75em;
+    font-size: 0.72em;
     font-weight: 600;
-    line-height: 1.4em;
+    line-height: 1.5em;
     white-space: nowrap;
     background: var(--SmartThemeBotMesBlurTintColor, rgba(0,0,0,0.25));
     color: var(--SmartThemeBodyColor, inherit);
     border: 1px solid var(--SmartThemeBorderColor, transparent);
-    vertical-align: middle;
 }
 .enh_tts_progress_wait {
     background: #a6761d;
     color: #fff;
+    border-color: #a6761d;
     animation: enh_tts_pulse 1s ease-in-out infinite;
 }
 @keyframes enh_tts_pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.55 } }
-.enh_tts_replay.enh_tts_busy { color: #c8a24a; }
-.enh_tts_replay.enh_tts_error { color: #c0392b; }
-.enh_tts_replay.enh_tts_ready { color: inherit; }
 `;
     $('<style id="enh_tts_styles"></style>').text(css).appendTo(document.head);
 }
