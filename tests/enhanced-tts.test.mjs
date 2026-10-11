@@ -143,12 +143,20 @@ test('prepareVoiceSegments: flattens and splits', () => {
 // payload + cache key + instructions
 // ---------------------------------------------------------------------------
 
-test('buildGeminiTtsPayload: prepends style instruction, defaults api', () => {
-    const p = buildGeminiTtsPayload({ text: '"hi"', voice: 'Kore', model: 'm', instruction: 'elderly, weary' });
-    assert.ok(p.text.startsWith('elderly, weary'));
-    assert.ok(p.text.includes('"hi"'));
+test('buildGeminiTtsPayload: keeps text verbatim, routes style separately', () => {
+    const p = buildGeminiTtsPayload({ text: '"hi" <gasp>', voice: 'Kore', model: 'm', instruction: 'elderly, weary' });
+    // The transcript must stay EXACT — style must never leak into spoken text.
+    assert.equal(p.text, '"hi" <gasp>');
+    assert.ok(!p.text.includes('elderly'), 'style must not appear in spoken text');
+    assert.equal(p.style, 'elderly, weary');
     assert.equal(p.voice, 'Kore');
     assert.equal(p.api, 'makersuite');
+});
+
+test('buildGeminiTtsPayload: empty style yields empty string (server omits it)', () => {
+    const p = buildGeminiTtsPayload({ text: 'read me', voice: 'Kore', model: 'm' });
+    assert.equal(p.text, 'read me');
+    assert.equal(p.style, '');
 });
 
 test('makeVoiceCacheKey: stable and sensitive to voice', () => {

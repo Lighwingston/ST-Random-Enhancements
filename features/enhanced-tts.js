@@ -188,7 +188,10 @@ async function synthesizeFragment(fragment) {
     if (!response.ok) {
         let message = `HTTP ${response.status}`;
         try { message = (await response.json()).error || message; } catch { /* keep http error */ }
-        throw new Error(message);
+        const err = new Error(message);
+        err.status = response.status;
+        err.retryAfterMs = parseRetryAfter(response.headers.get('retry-after'), message);
+        throw err;
     }
 
     const buffer = await response.arrayBuffer();
@@ -197,8 +200,58 @@ async function synthesizeFragment(fragment) {
 }
 
 /**
+ * Status codes worth waiting out rather than failing on — free-tier rate limits
+ * (429) and transient server/overload responses.
+ */
+const RETRYABLE_STATUS = new Set([429, 500, 502, 503, 504]);
+
+/**
+ * Pull a retry delay (ms) from a Retry-After header or a Google error body that
+ * mentions "retry in 34s". Returns 0 when nothing usable is found.
+ */
+function parseRetryAfter(headerValue, message = '') {
+    if (headerValue) {
+        const secs = Number(headerValue);
+        if (Number.isFinite(secs) && secs >= 0) return Math.min(secs * 1000, 120000);
+        const when = Date.parse(headerValue);
+        if (!Number.isNaN(when)) return Math.min(Math.max(when - Date.now(), 0), 120000);
+    }
+    const m = /retry.{0,12}?(\d+(?:\.\d+)?)\s*(ms|s|seconds?)/i.exec(String(message));
+    if (m) {
+        const n = Number(m[1]);
+        return Math.min(/ms/i.test(m[2]) ? n : n * 1000, 120000);
+    }
+    return 0;
+}
+
+const sleep = (ms) => new Promise(res => setTimeout(res, ms));
+
+/**
+ * Synthesize one fragment, waiting out rate limits instead of aborting. Reports
+ * a 'waiting' beat through onBeat so the UI can show the countdown; retries with
+ * exponential backoff (capped) until it succeeds or hits a non-retryable error.
+ */
+async function synthesizeFragmentResilient(fragment, onBeat) {
+    let attempt = 0;
+    for (;;) {
+        try {
+            return await synthesizeFragment(fragment);
+        } catch (err) {
+            if (!RETRYABLE_STATUS.has(err.status)) throw err;
+            attempt++;
+            const backoff = Math.min(2000 * 2 ** (attempt - 1), 32000);
+            const waitMs = Math.max(err.retryAfterMs || 0, backoff);
+            console.debug(`${LOG_PREFIX} fragment hit ${err.status}; waiting ${waitMs}ms (attempt ${attempt})`);
+            onBeat?.(waitMs);
+            await sleep(waitMs);
+        }
+    }
+}
+
+/**
  * Build the full assembled audio for a message. Reports progress through
- * onProgress(done, total). Returns an object URL, or null if nothing to speak.
+ * onProgress(done, total, info) where info is { waitingMs } during a rate-limit
+ * wait. Returns an object URL, or null if nothing to speak.
  */
 async function buildAudioForMessage(rawText, onProgress) {
     const c = cfg();
@@ -214,12 +267,16 @@ async function buildAudioForMessage(rawText, onProgress) {
     onProgress?.(done, total);
 
     // Synthesize in order with a small concurrency cap, preserving positions.
+    // Rate limits (429) are waited out, not thrown — a slow reply beats a dead one.
     const buffers = new Array(total);
     let next = 0;
     async function worker() {
         while (next < total) {
             const index = next++;
-            buffers[index] = await synthesizeFragment(fragments[index]);
+            buffers[index] = await synthesizeFragmentResilient(
+                fragments[index],
+                (waitingMs) => onProgress?.(done, total, { waitingMs }),
+            );
             done++;
             onProgress?.(done, total);
         }
@@ -250,17 +307,28 @@ function getMessageEl(messageId) {
     return $(`#chat .mes[mesid="${messageId}"]`);
 }
 
-/** Reflect progress / ready state on a message's replay button. */
-function setButtonState($btn, state, label) {
+/** Reflect progress / ready state on a message's replay button + visible badge. */
+function setButtonState($btn, state, label, badge) {
     $btn.removeClass('enh_tts_busy enh_tts_ready enh_tts_error');
     if (state === 'busy') $btn.addClass('enh_tts_busy');
     if (state === 'ready') $btn.addClass('enh_tts_ready');
     if (state === 'error') $btn.addClass('enh_tts_error');
     if (label !== undefined) $btn.attr('title', label);
+
+    // Visible progress badge sits right after the button so the user can watch
+    // generation advance without hovering for the tooltip.
+    const $badge = $btn.siblings('.enh_tts_progress').first();
+    if ($badge.length === 0) return;
+    if (badge === undefined || badge === null || badge === '') {
+        $badge.hide().text('');
+    } else {
+        $badge.text(badge).toggleClass('enh_tts_progress_wait', state === 'busy' && /wait/i.test(String(badge))).show();
+    }
 }
 
 /**
- * Ensure a message has an Enhanced-TTS replay button in its extra-buttons row.
+ * Ensure a message has an Enhanced-TTS replay button + progress badge in its
+ * extra-buttons row.
  */
 function ensureReplayButton(messageId) {
     const $mes = getMessageEl(messageId);
@@ -270,7 +338,18 @@ function ensureReplayButton(messageId) {
     const $btn = $(
         '<div class="mes_button enh_tts_replay fa-solid fa-wave-square" ' +
         'title="Play narrated audio" tabindex="0"></div>');
+    const $badge = $('<span class="enh_tts_progress" style="display:none"></span>');
+    $row.prepend($badge);
     $row.prepend($btn);
+}
+
+/** Format a progress badge like "3/8" or "waiting 12s". */
+function progressBadge(done, total, info) {
+    if (info?.waitingMs) {
+        const secs = Math.ceil(info.waitingMs / 1000);
+        return `rate-limited · retry ${secs}s (${done}/${total})`;
+    }
+    return `${done}/${total}`;
 }
 
 /**
@@ -294,21 +373,25 @@ async function playMessage(messageId, { forcePlay = true } = {}) {
             audioElement.src = assembledCache.get(hash).url;
             audioElement.play().catch(() => {});
         }
-        setButtonState($btn, 'ready', 'Play narrated audio');
+        setButtonState($btn, 'ready', 'Play narrated audio', null);
         return;
     }
 
     try {
-        setButtonState($btn, 'busy', 'Generating…');
-        const url = await buildAudioForMessage(rawText, (done, total) => {
-            setButtonState($btn, 'busy', `Generating ${done}/${total}…`);
+        setButtonState($btn, 'busy', 'Generating…', 'starting…');
+        const url = await buildAudioForMessage(rawText, (done, total, info) => {
+            const badge = progressBadge(done, total, info);
+            const title = info?.waitingMs
+                ? `Rate-limited — waiting to resume (${done}/${total} done)`
+                : `Generating ${done}/${total}…`;
+            setButtonState($btn, 'busy', title, badge);
         });
         if (!url) {
-            setButtonState($btn, 'ready', 'Nothing to narrate');
+            setButtonState($btn, 'ready', 'Nothing to narrate', null);
             return;
         }
         assembledCache.set(hash, { url });
-        setButtonState($btn, 'ready', 'Play narrated audio');
+        setButtonState($btn, 'ready', 'Play narrated audio', null);
         if (forcePlay) {
             stopPlayback();
             audioElement.src = url;
@@ -316,7 +399,7 @@ async function playMessage(messageId, { forcePlay = true } = {}) {
         }
     } catch (err) {
         console.error(`${LOG_PREFIX} Synthesis failed:`, err);
-        setButtonState($btn, 'error', `TTS error: ${err.message}`);
+        setButtonState($btn, 'error', `TTS error: ${err.message}`, 'error');
         window.toastr?.error(`Enhanced TTS: ${err.message}`);
     }
 }
@@ -470,9 +553,11 @@ const settingsHtml = `
 <hr>
 <h4>Voice slots</h4>
 <small class="textAlignCenter" style="display:block">
-    Assign a label (character), a Gemini voice, and an optional style prompt
-    (e.g. "elderly, weary, slow") to each slot. Disabled slots are omitted from
-    the AI instructions.
+    Assign a label (character) and a Gemini voice to each slot. The optional
+    style is a <i>short</i> delivery cue — e.g. "weary, slow" or "whispering" —
+    sent as turn-level direction (<code>speech_metadata.style</code>), so it steers
+    the voice <b>without being read aloud</b>. Keep it brief; long "director's
+    notes" cause voice drift. Disabled slots are omitted from the AI instructions.
 </small>
 <div id="enh_tts_slots"></div>
 
@@ -529,7 +614,7 @@ function slotRowHtml(slot) {
         <div class="menu_button enh_tts_slot_preview fa-solid fa-play" title="Preview voice" style="flex:0 0 auto"></div>
     </div>
     <select class="enh_tts_slot_voice text_pole"></select>
-    <input type="text" class="enh_tts_slot_style text_pole" placeholder="Style prompt (optional) — e.g. elderly, weary" />
+    <input type="text" class="enh_tts_slot_style text_pole" placeholder="Short style cue (optional) — e.g. weary, slow / whispering" />
 </div>`;
 }
 
@@ -726,8 +811,45 @@ async function onPresetImport(file) {
 // Init
 // ---------------------------------------------------------------------------
 
+let stylesInjected = false;
+
+/** Inject the small stylesheet for the per-message progress badge once. */
+function injectStyles() {
+    if (stylesInjected) return;
+    stylesInjected = true;
+    const css = `
+.enh_tts_progress {
+    display: inline-flex;
+    align-items: center;
+    margin-left: 4px;
+    padding: 0 6px;
+    height: 1.4em;
+    border-radius: 8px;
+    font-size: 0.75em;
+    font-weight: 600;
+    line-height: 1.4em;
+    white-space: nowrap;
+    background: var(--SmartThemeBotMesBlurTintColor, rgba(0,0,0,0.25));
+    color: var(--SmartThemeBodyColor, inherit);
+    border: 1px solid var(--SmartThemeBorderColor, transparent);
+    vertical-align: middle;
+}
+.enh_tts_progress_wait {
+    background: #a6761d;
+    color: #fff;
+    animation: enh_tts_pulse 1s ease-in-out infinite;
+}
+@keyframes enh_tts_pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.55 } }
+.enh_tts_replay.enh_tts_busy { color: #c8a24a; }
+.enh_tts_replay.enh_tts_error { color: #c0392b; }
+.enh_tts_replay.enh_tts_ready { color: inherit; }
+`;
+    $('<style id="enh_tts_styles"></style>').text(css).appendTo(document.head);
+}
+
 export function init(contentContainer) {
     ensureDefaults();
+    injectStyles();
     contentContainer.append(settingsHtml);
     loadSettings();
 

@@ -197,23 +197,26 @@ export function prepareVoiceSegments(segments, maxChars = 1800) {
 
 /**
  * Build the request payload understood by SillyTavern's native Gemini route.
- * A per-slot style instruction is prepended as a natural-language cue; the
- * fragment text (expression tags included) follows verbatim.
+ *
+ * Gemini 3.8 TTS treats `text` as a STRICT verbatim transcript — anything in it
+ * is spoken. Per-turn delivery direction (emotion, pace, tone) must therefore
+ * travel in `speech_metadata.style`, NOT inside the text, or the model reads the
+ * instruction aloud. We keep the transcript verbatim (inline angle-bracket
+ * expression tags like <gasp> are legitimate and stay) and surface the per-slot
+ * style separately as `style`, which the server maps to `speech_metadata.style`.
  *
  * @param {{text:string, voice:string, model:string, api?:string, instruction?:string}} input
  */
 export function buildGeminiTtsPayload(input) {
-    const instruction = String(input?.instruction ?? '').trim();
+    const style = String(input?.instruction ?? '').trim();
     const text = String(input?.text ?? '');
-    const promptedText = instruction
-        ? `${instruction}\n\nSpeak the following text exactly, preserving expression markers:\n${text}`
-        : text;
 
     return {
-        text: promptedText,
+        text,                                   // verbatim transcript, read exactly
         voice: String(input?.voice ?? ''),
         model: String(input?.model ?? ''),
         api: input?.api || 'makersuite',
+        style,                                  // -> speech_metadata.style (empty = omitted)
     };
 }
 
