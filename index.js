@@ -30,6 +30,7 @@ const FEATURES = [
     // wrapper is the outermost one: it reshapes the request body first and
     // unwraps the JSON response last.
     { name: 'StructuredPrefill', path: './features/structured-prefill.js' },
+    { name: 'EnhancedTts', path: './features/enhanced-tts.js' },
     // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 
