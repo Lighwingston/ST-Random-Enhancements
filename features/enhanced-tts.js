@@ -47,12 +47,18 @@ const GEMINI_TTS_MODELS = [
     'gemini-2.5-flash-preview-tts',
 ];
 
-// Max number of fragments synthesized at once (keeps the API happy).
+// Max number of requests synthesized at once (keeps the API happy).
 const SYNTH_CONCURRENCY = 2;
 
 // Newlines are spoken as natural pauses by Gemini TTS and keep separately
 // marked lines readable without adding words that would be spoken aloud.
 const SLOT_BATCH_SEPARATOR = '\n\n';
+
+// A whole-slot request is much cheaper than one request per quote, but a very
+// large transcript can exceed the provider/proxy request timeout (524). Keep
+// ordinary batches large while giving long replies a bounded number of calls.
+const MAX_SLOT_BATCH_CHARS = 4800;
+const MIN_524_SPLIT_CHARS = 900;
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -337,12 +343,62 @@ const sleep = (ms) => new Promise(res => setTimeout(res, ms));
  * a 'waiting' beat through onBeat so the UI can show the countdown; retries with
  * exponential backoff (capped) until it succeeds or hits a non-retryable error.
  */
-async function synthesizeFragmentResilient(fragment, onBeat) {
+function splitTextForRequest(fragment, maxChars) {
+    const limit = Math.max(100, Number(maxChars) || MAX_SLOT_BATCH_CHARS);
+    const text = String(fragment?.text ?? '');
+    if (text.length <= limit) return text ? [{ slot: fragment.slot, text }] : [];
+
+    const pieces = [];
+    let remaining = text;
+    while (remaining.length > limit) {
+        // Prefer paragraph/line boundaries, then whitespace. This preserves
+        // the blank-line pauses used between merged quotes whenever possible.
+        let cut = remaining.lastIndexOf('\n', limit);
+        if (cut < Math.floor(limit * 0.5)) cut = remaining.lastIndexOf(' ', limit);
+        if (cut < Math.floor(limit * 0.5)) cut = limit;
+        const piece = remaining.slice(0, cut).trim();
+        if (piece) pieces.push({ slot: fragment.slot, text: piece });
+        remaining = remaining.slice(cut).trimStart();
+    }
+    if (remaining) pieces.push({ slot: fragment.slot, text: remaining });
+    return pieces;
+}
+
+async function synthesizeFragmentResilient(fragment, onBeat, recoveryDepth = 0) {
     let attempt = 0;
     for (;;) {
         try {
             return await synthesizeFragment(fragment);
         } catch (err) {
+            // 524 is normally a proxy timeout for a request whose generated
+            // audio is too long. Retry once for a transient timeout; if it
+            // persists, split only this batch and stitch its pieces back
+            // together. This keeps short/normal batches at one request per
+            // slot without allowing one long slot to discard all quote audio.
+            if (err.status === 524) {
+                if (attempt < 2) {
+                    attempt++;
+                    const waitMs = 3000;
+                    console.debug(`${LOG_PREFIX} fragment hit 524; retrying in ${waitMs}ms (attempt ${attempt})`);
+                    onBeat?.(waitMs);
+                    await sleep(waitMs);
+                    continue;
+                }
+
+                if (fragment.text.length >= MIN_524_SPLIT_CHARS && recoveryDepth < 4) {
+                    const pieces = splitTextForRequest(fragment, Math.ceil(fragment.text.length / 2));
+                    if (pieces.length > 1) {
+                        console.warn(`${LOG_PREFIX} fragment still timed out; splitting into ${pieces.length} smaller requests`);
+                        const buffers = [];
+                        for (const piece of pieces) {
+                            buffers.push(await synthesizeFragmentResilient(piece, onBeat, recoveryDepth + 1));
+                        }
+                        return concatWavBuffers(buffers, { gapMs: 0 });
+                    }
+                }
+                throw err;
+            }
+
             if (!RETRYABLE_STATUS.has(err.status)) throw err;
             attempt++;
             const backoff = Math.min(2000 * 2 ** (attempt - 1), 32000);
@@ -386,6 +442,16 @@ function batchSegmentsBySlot(segments) {
 }
 
 /**
+ * Keep the normal one-request-per-slot behavior, but pre-split long slot
+ * batches before they reach the proxy timeout boundary. A single unusually
+ * long quote is split at a word/line boundary as well.
+ */
+function prepareRequestBatches(segments) {
+    return batchSegmentsBySlot(segments)
+        .flatMap(fragment => splitTextForRequest(fragment, MAX_SLOT_BATCH_CHARS));
+}
+
+/**
  * Build the full assembled audio for a message. Reports progress through
  * onProgress(done, total, info) where info is { waitingMs } during a rate-limit
  * wait. Returns an object URL, or null if nothing to speak.
@@ -397,9 +463,10 @@ async function buildAudioForMessage(rawText, onProgress) {
 
     // One request per used slot: narrator prose (unmarked text) is collected
     // with all other narrator prose, while each marked speaker gets one batch.
-    // Do not split by c.maxCharsPerFragment here: that would recreate the
-    // per-quote request storm this batching is intended to eliminate.
-    const fragments = batchSegmentsBySlot(segments);
+    // Do not split at the old per-quote limit. Only oversized whole-slot
+    // batches are split, keeping normal responses at roughly one request per
+    // used voice slot while avoiding 524 timeouts on long replies.
+    const fragments = prepareRequestBatches(segments);
     if (fragments.length === 0) return null;
 
     const total = fragments.length;
