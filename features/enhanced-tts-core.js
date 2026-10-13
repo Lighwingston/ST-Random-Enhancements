@@ -21,6 +21,11 @@ const EXPRESSION_TAG_RE = /<\/?[a-z][a-z0-9 _-]{0,30}>/gi;
 
 const DEFAULT_MAX_SLOTS = 10;
 
+// Keep separately parsed fragments from running together when they are packed
+// after filtering (for example, when narrator prose is omitted in quotes mode).
+// This separator is part of the text and therefore part of maxCharsPerFragment.
+const VOICE_FRAGMENT_SEPARATOR = '\n';
+
 /**
  * Parse voice markers while assigning unmarked text to the narrator slot.
  * The parser is a scanner, not an HTML parser: arbitrary expression tags must
@@ -192,7 +197,26 @@ export function splitVoiceSegment(segment, maxChars = 1800) {
  * @param {number} [maxChars]
  */
 export function prepareVoiceSegments(segments, maxChars = 1800) {
-    return (segments || []).flatMap(segment => splitVoiceSegment(segment, maxChars));
+    const packed = [];
+    for (const segment of segments || []) {
+        if (!segment) continue;
+        const text = String(segment.text ?? '');
+        if (!text) continue;
+
+        const previous = packed.at(-1);
+        if (previous && previous.slot === segment.slot) {
+            // Create a new object rather than appending to an input or output
+            // object that a caller may still hold.
+            packed[packed.length - 1] = {
+                slot: previous.slot,
+                text: previous.text + VOICE_FRAGMENT_SEPARATOR + text,
+            };
+        } else {
+            packed.push({ slot: segment.slot, text });
+        }
+    }
+
+    return packed.flatMap(segment => splitVoiceSegment(segment, maxChars));
 }
 
 /**

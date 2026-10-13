@@ -115,6 +115,110 @@ function activeModel() {
 }
 
 // ---------------------------------------------------------------------------
+// AI instruction context
+// ---------------------------------------------------------------------------
+
+const MAX_CONTEXT_LABEL_LENGTH = 80;
+
+/**
+ * Keep conversation identity metadata short and line-safe. In particular, do
+ * not pass chat messages through this path: the instruction block only needs
+ * names to help the model map speakers to configured voice slots.
+ */
+function shortContextLabel(value) {
+    if (typeof value !== 'string' && typeof value !== 'number') return '';
+    return String(value)
+        .replace(/[\u0000-\u001f\u007f]/g, ' ')
+        .replace(/[\[\]<>]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, MAX_CONTEXT_LABEL_LENGTH);
+}
+
+/**
+ * Read only the active conversation's identity fields from SillyTavern.
+ * Context is optional because this module is also used by previews and while
+ * no chat is selected. Returns null rather than allowing a partial/odd
+ * context object to affect the normal instructions.
+ */
+function getMarkupInstructionContext() {
+    try {
+        if (typeof SillyTavern === 'undefined' || typeof SillyTavern.getContext !== 'function') return null;
+        const context = SillyTavern.getContext();
+        if (!context || typeof context !== 'object') return null;
+
+        // An empty chat is a settings/preview state, not an active conversation.
+        // Do not use or inspect message contents here.
+        if (!Array.isArray(context.chat) || context.chat.length === 0) return null;
+
+        const characters = Array.isArray(context.characters) ? context.characters : [];
+        const characterId = context.characterId;
+        const indexedCharacter = characterId !== undefined && characterId !== null
+            ? characters[Number(characterId)]
+            : null;
+        const namedCharacter = !indexedCharacter && context.name2
+            ? characters.find(character => character?.name === context.name2)
+            : null;
+        const characterName = shortContextLabel(
+            indexedCharacter?.name || namedCharacter?.name || context.name2,
+        );
+        const userName = shortContextLabel(context.name1);
+
+        const groupId = context.groupId;
+        const groups = Array.isArray(context.groups) ? context.groups : [];
+        const group = groupId !== undefined && groupId !== null && groupId !== ''
+            ? groups.find(candidate => String(candidate?.id) === String(groupId))
+            : null;
+        const groupName = shortContextLabel(group?.name);
+        const groupMembers = Array.isArray(group?.members)
+            ? group.members
+                .map(memberId => characters.find(character =>
+                    character?.avatar === memberId ||
+                    (character?.id !== undefined && String(character.id) === String(memberId)) ||
+                    character?.name === memberId,
+                ))
+                .map(character => shortContextLabel(character?.name))
+                .filter(Boolean)
+                .filter((name, index, names) => names.indexOf(name) === index)
+                .slice(0, 6)
+            : [];
+
+        const lines = [];
+        if (userName) lines.push(`  User: ${userName}`);
+        if (characterName) lines.push(`  Character/speaker: ${characterName}`);
+        const hasGroup = groupId !== undefined && groupId !== null && groupId !== '';
+        if (hasGroup) {
+            const suffix = groupMembers.length ? ` (members: ${groupMembers.join(', ')})` : '';
+            lines.push(`  Group: ${groupName || 'active group'}${suffix}`);
+        }
+        return lines.length ? lines : null;
+    } catch {
+        // getContext() is not guaranteed during extension startup or previews.
+        return null;
+    }
+}
+
+/**
+ * Build the one instruction block used by both auto-injection and the copy
+ * button. The context section is metadata for speaker selection, never text
+ * to be narrated or repeated in the response.
+ */
+function buildContextAwareInstructionBlock(slots, options = {}) {
+    const block = buildInstructionBlock(slots, options);
+    const contextLines = getMarkupInstructionContext();
+    if (!contextLines) return block;
+
+    return [
+        block,
+        '',
+        '[Conversation speaker context — metadata/instructions only; never spoken]',
+        ...contextLines,
+        '  Use these names only to choose the matching voice-slot marker; do not repeat this metadata as dialogue.',
+        '[/Conversation speaker context]',
+    ].join('\n');
+}
+
+// ---------------------------------------------------------------------------
 // Voice list (fetched once, cached in-module)
 // ---------------------------------------------------------------------------
 
@@ -462,7 +566,7 @@ function onPromptReady(eventData) {
     const chat = eventData?.chat;
     if (!Array.isArray(chat) || chat.length === 0) return;
 
-    const block = buildInstructionBlock(c.slots, { narratorSlot: c.narratorSlot, narrationMode: c.narrationMode });
+    const block = buildContextAwareInstructionBlock(c.slots, { narratorSlot: c.narratorSlot, narrationMode: c.narrationMode });
 
     let insertIndex = 0;
     for (let i = 0; i < chat.length; i++) {
@@ -887,7 +991,7 @@ export function init(contentContainer) {
 
     // Copy AI instructions
     $('#enh_tts_copy_btn').on('click', () => {
-        const block = buildInstructionBlock(cfg().slots, { narratorSlot: cfg().narratorSlot, narrationMode: cfg().narrationMode });
+        const block = buildContextAwareInstructionBlock(cfg().slots, { narratorSlot: cfg().narratorSlot, narrationMode: cfg().narrationMode });
         copyText(block);
         window.toastr?.info('AI instructions copied to clipboard.');
     });

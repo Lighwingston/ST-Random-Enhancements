@@ -139,6 +139,65 @@ test('prepareVoiceSegments: flattens and splits', () => {
     assert.ok(out.length >= 3);
 });
 
+test('prepareVoiceSegments: packs same-slot fragments made adjacent by narrator filtering', () => {
+    const { segments } = parseVoiceMarkup(
+        '[v2]"<gasp>first"[/v2] narration [v2]"second"[/v2]',
+        { narratorSlot: 1 });
+    const speakable = extractSpeakableSegments(segments, { mode: 'quotes', narratorSlot: 1 });
+
+    assert.deepEqual(prepareVoiceSegments(speakable, 100), [
+        { slot: 2, text: '"<gasp>first"\n"second"' },
+    ]);
+});
+
+test('prepareVoiceSegments: keeps different slots ordered and separate', () => {
+    const input = [
+        { slot: 2, text: 'first' },
+        { slot: 3, text: 'second' },
+        { slot: 2, text: 'third' },
+    ];
+    assert.deepEqual(prepareVoiceSegments(input, 100), input);
+});
+
+test('prepareVoiceSegments: counts the newline separator in the size bound', () => {
+    const fits = prepareVoiceSegments([
+        { slot: 2, text: 'a'.repeat(49) },
+        { slot: 2, text: 'b'.repeat(50) },
+    ], 100);
+    assert.deepEqual(fits, [{ slot: 2, text: `${'a'.repeat(49)}\n${'b'.repeat(50)}` }]);
+    assert.ok(fits.every(fragment => fragment.text.length <= 100));
+
+    const splits = prepareVoiceSegments([
+        { slot: 2, text: 'a'.repeat(49) },
+        { slot: 2, text: 'b'.repeat(51) },
+    ], 100);
+    assert.ok(splits.length > 1);
+    assert.ok(splits.every(fragment => fragment.text.length <= 100));
+});
+
+test('prepareVoiceSegments: does not mutate input fragments', () => {
+    const input = [
+        { slot: 2, text: 'first' },
+        { slot: 2, text: 'second' },
+    ];
+    const before = input.map(fragment => ({ ...fragment }));
+    prepareVoiceSegments(input, 100);
+    assert.deepEqual(input, before);
+});
+
+test('prepareVoiceSegments: audiobook mode retains narrator order and slot boundaries', () => {
+    const { segments } = parseVoiceMarkup(
+        'intro [v2]dialogue[/v2] outro',
+        { narratorSlot: 1 });
+    const speakable = extractSpeakableSegments(segments, { mode: 'audiobook', narratorSlot: 1 });
+
+    assert.deepEqual(prepareVoiceSegments(speakable, 100), [
+        { slot: 1, text: 'intro ' },
+        { slot: 2, text: 'dialogue' },
+        { slot: 1, text: ' outro' },
+    ]);
+});
+
 // ---------------------------------------------------------------------------
 // payload + cache key + instructions
 // ---------------------------------------------------------------------------
