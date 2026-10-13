@@ -2,9 +2,9 @@
  * Enhanced TTS Feature
  *
  * Multi-voice narration for AI responses. The AI wraps spoken dialogue in
- * voice-slot markers — [v2]"line"[/v2] — and this feature synthesizes each
- * quote with the voice configured for that slot, assembles every fragment into
- * one audio file per response, shows progress, and offers per-message replay.
+ * voice-slot markers — [v2]"line"[/v2] — and this feature batches all text for
+ * each voice slot into one Gemini request, assembles the resulting voice blocks
+ * into one audio file per response, shows progress, and offers per-message replay.
  *
  * Design notes:
  *  - Markers are square-bracket wrappers so they can never collide with Gemini's
@@ -26,8 +26,6 @@ import { copyText, isValidUrl, getStringHash } from '../../../../utils.js';
 
 import {
     parseVoiceMarkup,
-    extractSpeakableSegments,
-    prepareVoiceSegments,
     buildGeminiTtsPayload,
     makeVoiceCacheKey,
     buildInstructionBlock,
@@ -51,6 +49,10 @@ const GEMINI_TTS_MODELS = [
 
 // Max number of fragments synthesized at once (keeps the API happy).
 const SYNTH_CONCURRENCY = 2;
+
+// Newlines are spoken as natural pauses by Gemini TTS and keep separately
+// marked lines readable without adding words that would be spoken aloud.
+const SLOT_BATCH_SEPARATOR = '\n\n';
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -353,6 +355,37 @@ async function synthesizeFragmentResilient(fragment, onBeat) {
 }
 
 /**
+ * Collapse the parsed transcript into one request per voice slot.
+ *
+ * This deliberately operates on parsed segments rather than the quote-only
+ * result: unmarked prose belongs to the narrator slot and is also collected
+ * into one request. The first-seen slot order is retained for audio assembly.
+ * Once a slot's audio is generated, its individual lines cannot be
+ * re-interleaved with another slot without making separate requests, so this
+ * is the intentional request-minimizing mode.
+ *
+ * @param {Array<{slot:number,text:string}>} segments
+ * @returns {Array<{slot:number,text:string}>}
+ */
+function batchSegmentsBySlot(segments) {
+    const batches = new Map();
+    for (const segment of segments || []) {
+        if (!segment) continue;
+        const text = String(segment.text ?? '').trim();
+        if (!text) continue;
+
+        const slot = Number(segment.slot);
+        const previous = batches.get(slot);
+        if (previous) {
+            previous.text += `${SLOT_BATCH_SEPARATOR}${text}`;
+        } else {
+            batches.set(slot, { slot, text });
+        }
+    }
+    return [...batches.values()];
+}
+
+/**
  * Build the full assembled audio for a message. Reports progress through
  * onProgress(done, total, info) where info is { waitingMs } during a rate-limit
  * wait. Returns an object URL, or null if nothing to speak.
@@ -362,15 +395,18 @@ async function buildAudioForMessage(rawText, onProgress) {
     const { segments, warnings } = parseVoiceMarkup(rawText, { narratorSlot: c.narratorSlot, maxSlots: MAX_SLOTS });
     for (const w of warnings) console.debug(`${LOG_PREFIX} ${w}`);
 
-    const speakable = extractSpeakableSegments(segments, { mode: c.narrationMode, narratorSlot: c.narratorSlot });
-    const fragments = prepareVoiceSegments(speakable, c.maxCharsPerFragment);
+    // One request per used slot: narrator prose (unmarked text) is collected
+    // with all other narrator prose, while each marked speaker gets one batch.
+    // Do not split by c.maxCharsPerFragment here: that would recreate the
+    // per-quote request storm this batching is intended to eliminate.
+    const fragments = batchSegmentsBySlot(segments);
     if (fragments.length === 0) return null;
 
     const total = fragments.length;
     let done = 0;
     onProgress?.(done, total);
 
-    // Synthesize in order with a small concurrency cap, preserving positions.
+    // Synthesize the first-seen slot batches with a small concurrency cap.
     // Rate limits (429) are waited out, not thrown — a slow reply beats a dead one.
     const buffers = new Array(total);
     let next = 0;
