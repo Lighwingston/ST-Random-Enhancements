@@ -1,7 +1,7 @@
 /**
  * Unit tests for features/enhanced-tts-core.js
  *
- *   node --test tests/
+ *   node --test "tests/*.test.mjs"
  *
  * The core helpers have no SillyTavern imports, so we import the file directly
  * (unlike structured-prefill, which needs the stub rewrite in load-feature.mjs).
@@ -20,10 +20,15 @@ const {
     stripVoiceMarkup,
     stripExpressionTags,
     cleanForDisplay,
+    mergeVoiceSegments,
     extractSpeakableSegments,
+    hasSpeakableContent,
+    prepareSpeechText,
     splitVoiceSegment,
-    prepareVoiceSegments,
+    packTurns,
     buildGeminiTtsPayload,
+    buildGeminiTurnsPayload,
+    supportsStructuredTurns,
     makeVoiceCacheKey,
     buildInstructionBlock,
     parseWav,
@@ -81,6 +86,37 @@ test('parseVoiceMarkup: unclosed opener warns', () => {
     assert.ok(warnings.some(w => /not explicitly closed/i.test(w)));
 });
 
+test('parseVoiceMarkup: a cue on the opener becomes that line\'s style', () => {
+    const { segments, warnings } = parseVoiceMarkup(
+        'She froze. [v2:  whispering   urgently ]"Get down."[/v2] Then [v2]"Now."[/v2]',
+        { narratorSlot: 1 });
+    assert.deepEqual(warnings, []);
+    assert.deepEqual(segments, [
+        { slot: 1, text: 'She froze. ' },
+        { slot: 2, text: '"Get down."', style: 'whispering urgently' },
+        { slot: 1, text: ' Then ' },
+        { slot: 2, text: '"Now."' },
+    ]);
+});
+
+test('parseVoiceMarkup: an over-long cue is clipped, not spoken', () => {
+    const { segments } = parseVoiceMarkup(`[v2: ${'very '.repeat(40)}]"hi"[/v2]`, { narratorSlot: 1 });
+    assert.equal(segments.length, 1);
+    assert.equal(segments[0].text, '"hi"');
+    assert.ok(segments[0].style.length <= 100);
+});
+
+test('mergeVoiceSegments: keeps lines with different styles apart', () => {
+    assert.deepEqual(mergeVoiceSegments([
+        { slot: 2, text: 'a', style: 'calm' },
+        { slot: 2, text: 'b', style: 'calm' },
+        { slot: 2, text: 'c', style: 'angry' },
+    ]), [
+        { slot: 2, text: 'ab', style: 'calm' },
+        { slot: 2, text: 'c', style: 'angry' },
+    ]);
+});
+
 // ---------------------------------------------------------------------------
 // stripping / display
 // ---------------------------------------------------------------------------
@@ -97,6 +133,28 @@ test('stripExpressionTags: removes known tags, keeps prose "<"', () => {
 
 test('cleanForDisplay: strips both and tidies whitespace', () => {
     assert.equal(cleanForDisplay('Kael. [v2]"<sigh> fine."[/v2]'), 'Kael. " fine."');
+});
+
+test('cleanForDisplay: strips markers that carry a cue', () => {
+    assert.equal(cleanForDisplay('[v2: furious, shouting]"Out!"[/v2]'), '"Out!"');
+});
+
+test('prepareSpeechText: drops formatting and unspoken blocks, keeps markers and tags', () => {
+    const raw = [
+        '*Kael leans back.* [v2: dry]"Oh, **really**?"[/v2] <sigh>',
+        '<details><summary>Stats</summary>HP: 10</details>',
+        '```js\nconsole.log(1)\n```',
+        '<span style="color:red">The __door__ creaks.</span> ~~no~~ [a link](https://x.y) ![img](a.png)',
+        '# Chapter two',
+        'snake_case stays',
+    ].join('\n');
+    assert.equal(prepareSpeechText(raw), [
+        'Kael leans back. [v2: dry]"Oh, really?"[/v2] <sigh>',
+        '',
+        'The door creaks. no a link',
+        'Chapter two',
+        'snake_case stays',
+    ].join('\n'));
 });
 
 // ---------------------------------------------------------------------------
@@ -116,6 +174,35 @@ test('extractSpeakableSegments: audiobook mode keeps everything speakable', () =
     assert.ok(!speak.some(s => !s.text.trim()), 'whitespace-only segments are dropped');
 });
 
+test('extractSpeakableSegments: audiobook mode keeps narration between quotes, in order', () => {
+    const { segments } = parseVoiceMarkup(
+        'Kael folded his arms. [v2: cold]"Leave."[/v2] Mira laughed. [v3]"Make me."[/v3]',
+        { narratorSlot: 1 });
+    assert.deepEqual(extractSpeakableSegments(segments, { mode: 'audiobook', narratorSlot: 1 }), [
+        { slot: 1, text: 'Kael folded his arms.' },
+        { slot: 2, text: '"Leave."', style: 'cold' },
+        { slot: 1, text: 'Mira laughed.' },
+        { slot: 3, text: '"Make me."' },
+    ]);
+});
+
+test('extractSpeakableSegments: quotes mode voices unwrapped quotes instead of dropping them', () => {
+    const { segments } = parseVoiceMarkup(
+        'He turned. «Где ты был?» [v2]"Out."[/v2] She sighed. “Fine.” Nothing else.',
+        { narratorSlot: 1 });
+    assert.deepEqual(extractSpeakableSegments(segments, { mode: 'quotes', narratorSlot: 1 }), [
+        { slot: 1, text: '«Где ты был?»' },
+        { slot: 2, text: '"Out."' },
+        { slot: 1, text: '“Fine.”' },
+    ]);
+});
+
+test('hasSpeakableContent: punctuation and emphasis leftovers are not speech', () => {
+    assert.equal(hasSpeakableContent(' ." — '), false);
+    assert.equal(hasSpeakableContent('<sigh>'), true);
+    assert.equal(hasSpeakableContent('Да.'), true);
+});
+
 // ---------------------------------------------------------------------------
 // splitVoiceSegment
 // ---------------------------------------------------------------------------
@@ -133,69 +220,71 @@ test('splitVoiceSegment: long text splits on whitespace and keeps slot/order', (
     assert.equal(pieces.map(p => p.text).join(' ').replace(/\s+/g, ' '), text);
 });
 
-test('prepareVoiceSegments: flattens and splits', () => {
-    const long = 'x'.repeat(250);
-    const out = prepareVoiceSegments([{ slot: 1, text: long }], 100);
-    assert.ok(out.length >= 3);
+test('splitVoiceSegment: prefers a sentence end and keeps the other fields', () => {
+    const first = 'The rain kept falling on the old tin roof of the cabin all night long. ';
+    const text = first + 'word '.repeat(30).trim();
+    const pieces = splitVoiceSegment({ slot: 2, text, style: 'tired', voice: 'Kore' }, 100);
+    assert.equal(pieces[0].text, first.trim(), 'first cut lands after the full stop');
+    assert.ok(pieces.every(p => p.slot === 2 && p.style === 'tired' && p.voice === 'Kore'));
+    assert.ok(pieces.every(p => p.text.length <= 100));
 });
 
-test('prepareVoiceSegments: packs same-slot fragments made adjacent by narrator filtering', () => {
-    const { segments } = parseVoiceMarkup(
-        '[v2]"<gasp>first"[/v2] narration [v2]"second"[/v2]',
-        { narratorSlot: 1 });
-    const speakable = extractSpeakableSegments(segments, { mode: 'quotes', narratorSlot: 1 });
-
-    assert.deepEqual(prepareVoiceSegments(speakable, 100), [
-        { slot: 2, text: '"<gasp>first"\n"second"' },
-    ]);
+test('splitVoiceSegment: never cuts inside an expression tag', () => {
+    // The last space before the 100-char limit sits inside <short pause>.
+    const text = `${'abcd '.repeat(18)}<short pause> and then the rest of the line goes on`;
+    const pieces = splitVoiceSegment({ slot: 2, text }, 100);
+    assert.equal(pieces.length, 2);
+    assert.ok(pieces[1].text.startsWith('<short pause>'), pieces[1].text);
+    assert.equal(pieces.map(p => p.text).join(' '), text);
 });
 
-test('prepareVoiceSegments: keeps different slots ordered and separate', () => {
-    const input = [
-        { slot: 2, text: 'first' },
-        { slot: 3, text: 'second' },
-        { slot: 2, text: 'third' },
+// ---------------------------------------------------------------------------
+// packTurns — request planning
+// ---------------------------------------------------------------------------
+
+const turn = (voice, text, style = '') => ({ voice, text, style });
+
+test('packTurns: narrator plus one character is a single request in reading order', () => {
+    const turns = [
+        turn('Charon', 'Kael folded his arms.'),
+        turn('Fenrir', '"You shouldn\'t be here."', 'cold'),
+        turn('Charon', 'Mira laughed.'),
+        turn('Fenrir', '"I mean it."'),
     ];
-    assert.deepEqual(prepareVoiceSegments(input, 100), input);
+    assert.deepEqual(packTurns(turns, { maxSpeakers: 2, maxChars: 1800 }), [turns]);
 });
 
-test('prepareVoiceSegments: counts the newline separator in the size bound', () => {
-    const fits = prepareVoiceSegments([
-        { slot: 2, text: 'a'.repeat(49) },
-        { slot: 2, text: 'b'.repeat(50) },
-    ], 100);
-    assert.deepEqual(fits, [{ slot: 2, text: `${'a'.repeat(49)}\n${'b'.repeat(50)}` }]);
-    assert.ok(fits.every(fragment => fragment.text.length <= 100));
-
-    const splits = prepareVoiceSegments([
-        { slot: 2, text: 'a'.repeat(49) },
-        { slot: 2, text: 'b'.repeat(51) },
-    ], 100);
-    assert.ok(splits.length > 1);
-    assert.ok(splits.every(fragment => fragment.text.length <= 100));
-});
-
-test('prepareVoiceSegments: does not mutate input fragments', () => {
-    const input = [
-        { slot: 2, text: 'first' },
-        { slot: 2, text: 'second' },
+test('packTurns: a third voice starts a new request without reordering', () => {
+    const turns = [
+        turn('Charon', 'n1'), turn('Fenrir', 'a1'), turn('Charon', 'n2'),
+        turn('Kore', 'b1'), turn('Charon', 'n3'), turn('Fenrir', 'a2'),
     ];
-    const before = input.map(fragment => ({ ...fragment }));
-    prepareVoiceSegments(input, 100);
-    assert.deepEqual(input, before);
+    const requests = packTurns(turns, { maxSpeakers: 2, maxChars: 1800 });
+    assert.deepEqual(requests.map(r => r.map(t => t.text)), [['n1', 'a1', 'n2'], ['b1', 'n3'], ['a2']]);
+    assert.deepEqual(requests.flat(), turns, 'every turn kept, in order');
+    assert.ok(requests.every(r => new Set(r.map(t => t.voice)).size <= 2));
 });
 
-test('prepareVoiceSegments: audiobook mode retains narrator order and slot boundaries', () => {
-    const { segments } = parseVoiceMarkup(
-        'intro [v2]dialogue[/v2] outro',
-        { narratorSlot: 1 });
-    const speakable = extractSpeakableSegments(segments, { mode: 'audiobook', narratorSlot: 1 });
+test('packTurns: the character budget closes a request', () => {
+    const turns = [turn('Charon', 'a'.repeat(80)), turn('Fenrir', 'b'.repeat(30)), turn('Charon', 'c'.repeat(10))];
+    const requests = packTurns(turns, { maxSpeakers: 2, maxChars: 100 });
+    assert.deepEqual(requests.map(r => r.length), [1, 2]);
+});
 
-    assert.deepEqual(prepareVoiceSegments(speakable, 100), [
-        { slot: 1, text: 'intro ' },
-        { slot: 2, text: 'dialogue' },
-        { slot: 1, text: ' outro' },
-    ]);
+test('packTurns: the single-voice route groups only same voice and same style', () => {
+    const turns = [
+        turn('Charon', 'n1'), turn('Charon', 'n2'), turn('Charon', 'n3', 'tense'),
+        turn('Fenrir', 'a1'), turn('Charon', 'n4'),
+    ];
+    const requests = packTurns(turns, { maxSpeakers: 1, maxChars: 1800, perTurnStyle: false });
+    assert.deepEqual(requests.map(r => r.map(t => t.text)), [['n1', 'n2'], ['n3'], ['a1'], ['n4']]);
+});
+
+test('packTurns: does not mutate its input', () => {
+    const turns = [turn('Charon', 'n1'), turn('Fenrir', 'a1')];
+    const before = structuredClone(turns);
+    packTurns(turns, { maxSpeakers: 2 });
+    assert.deepEqual(turns, before);
 });
 
 // ---------------------------------------------------------------------------
@@ -226,6 +315,49 @@ test('makeVoiceCacheKey: stable and sensitive to voice', () => {
     assert.notEqual(a, c);
 });
 
+test('makeVoiceCacheKey: sensitive to per-turn style', () => {
+    const turns = [turn('Charon', 'n'), turn('Kore', 'q', 'calm')];
+    const angry = [turn('Charon', 'n'), turn('Kore', 'q', 'angry')];
+    assert.notEqual(
+        makeVoiceCacheKey(buildGeminiTurnsPayload(turns, { model: 'm' })),
+        makeVoiceCacheKey(buildGeminiTurnsPayload(angry, { model: 'm' })));
+});
+
+test('buildGeminiTurnsPayload: two voices use multi-speaker with a style per turn', () => {
+    const p = buildGeminiTurnsPayload([
+        turn('Charon', 'Kael folded his arms.'),
+        turn('Fenrir', '"You shouldn\'t be here." <sigh>', 'cold, clipped'),
+    ], { model: 'gemini-3.8-flash-tts' });
+    assert.equal(p.voice, '');
+    assert.deepEqual(p.speakers, [{ speaker: 'Charon', voice: 'Charon' }, { speaker: 'Fenrir', voice: 'Fenrir' }]);
+    assert.deepEqual(p.turns, [
+        { text: 'Kael folded his arms.', style: '', speaker: 'Charon' },
+        { text: '"You shouldn\'t be here." <sigh>', style: 'cold, clipped', speaker: 'Fenrir' },
+    ]);
+    assert.equal(p.model, 'gemini-3.8-flash-tts');
+    assert.equal(p.api, 'makersuite');
+});
+
+test('buildGeminiTurnsPayload: one voice keeps per-turn styles without speakers', () => {
+    const p = buildGeminiTurnsPayload([turn('Kore', 'a', 'calm'), turn('Kore', 'b', 'angry')], { model: 'm' });
+    assert.equal(p.voice, 'Kore');
+    assert.deepEqual(p.speakers, []);
+    assert.deepEqual(p.turns, [{ text: 'a', style: 'calm' }, { text: 'b', style: 'angry' }]);
+});
+
+test('buildGeminiTurnsPayload: refuses more than two voices', () => {
+    assert.throws(() => buildGeminiTurnsPayload([turn('A', 'a'), turn('B', 'b'), turn('C', 'c')], { model: 'm' }));
+});
+
+test('supportsStructuredTurns: 3.8+ take speech_metadata, older previews do not', () => {
+    assert.equal(supportsStructuredTurns('gemini-3.8-flash-tts'), true);
+    assert.equal(supportsStructuredTurns('gemini-3.8-flash-lite-tts'), true);
+    assert.equal(supportsStructuredTurns('gemini-3.10-flash-tts'), true);
+    assert.equal(supportsStructuredTurns('gemini-3.1-flash-tts-preview'), false);
+    assert.equal(supportsStructuredTurns('gemini-2.5-pro-preview-tts'), false);
+    assert.equal(supportsStructuredTurns('models/gemini-2.5-flash-preview-tts'), false);
+});
+
 test('buildInstructionBlock: lists enabled slots and marks the narrator', () => {
     const slots = [
         { id: 1, label: 'Narrator', voiceName: 'Charon', enabled: true },
@@ -239,6 +371,7 @@ test('buildInstructionBlock: lists enabled slots and marks the narrator', () => 
     assert.ok(block.includes('gruff'));
     assert.ok(!block.includes('Slot 3'), 'disabled slot omitted');
     assert.ok(block.includes('[v2]'), 'includes a worked example');
+    assert.ok(block.includes('[v2: whispering urgently]'), 'documents the per-line cue');
 });
 
 // ---------------------------------------------------------------------------

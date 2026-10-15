@@ -2,20 +2,27 @@
  * Enhanced TTS Feature
  *
  * Multi-voice narration for AI responses. The AI wraps spoken dialogue in
- * voice-slot markers — [v2]"line"[/v2] — and this feature batches all text for
- * each voice slot into one Gemini request, assembles the resulting voice blocks
- * into one audio file per response, shows progress, and offers per-message replay.
+ * voice-slot markers — [v2]"line"[/v2] or [v2: whispering]"line"[/v2] — and
+ * this feature turns the reply into ordered speech turns (narration and
+ * dialogue in reading order), packs them into as few Gemini requests as
+ * possible, assembles one audio file per response, shows progress, and offers
+ * per-message replay.
  *
  * Design notes:
  *  - Markers are square-bracket wrappers so they can never collide with Gemini's
  *    angle-bracket expression tags (<gasp>, <sigh>, ...). Expression tags ride
  *    along to TTS inside a quote but are stripped from the visible message.
+ *  - Gemini's multi-speaker mode takes two voices per request with a style per
+ *    turn, so a narrator plus one character is a single request. A third voice
+ *    starts a new request; order is never changed.
  *  - Only Gemini (Google AI Studio) is wired. OpenAI / custom are placeholders.
  *  - All synthesis goes through SillyTavern's own authenticated route
  *    /api/google/generate-native-tts, so the API key never leaves the server.
+ *    Ordered turns need the extended route (see capabilities in
+ *    /list-native-voices); without it each request carries one voice.
  *
- * Pure logic (parsing, splitting, WAV assembly) lives in ./enhanced-tts-core.js
- * and is unit-tested under tests/.
+ * Pure logic (parsing, packing, splitting, WAV assembly) lives in
+ * ./enhanced-tts-core.js and is unit-tested under tests/.
  */
 
 import { extension_settings } from '../../../../extensions.js';
@@ -26,7 +33,13 @@ import { copyText, isValidUrl, getStringHash } from '../../../../utils.js';
 
 import {
     parseVoiceMarkup,
+    prepareSpeechText,
+    extractSpeakableSegments,
+    splitVoiceSegment,
+    packTurns,
+    supportsStructuredTurns,
     buildGeminiTtsPayload,
+    buildGeminiTurnsPayload,
     makeVoiceCacheKey,
     buildInstructionBlock,
     concatWavBuffers,
@@ -37,6 +50,7 @@ const SETTINGS_KEY = 'enhancements';
 const FEATURE_KEY = 'enhancedTts';
 const LOG_PREFIX = '[Enhancements:EnhancedTts]';
 const MAX_SLOTS = 10;
+const ASSEMBLED_CACHE_VERSION = 4;
 
 // Known Gemini TTS models (a custom name can also be typed).
 const GEMINI_TTS_MODELS = [
@@ -50,14 +64,10 @@ const GEMINI_TTS_MODELS = [
 // Max number of requests synthesized at once (keeps the API happy).
 const SYNTH_CONCURRENCY = 2;
 
-// Newlines are spoken as natural pauses by Gemini TTS and keep separately
-// marked lines readable without adding words that would be spoken aloud.
-const SLOT_BATCH_SEPARATOR = '\n\n';
-
-// A whole-slot request is much cheaper than one request per quote, but a very
-// large transcript can exceed the provider/proxy request timeout (524). Keep
-// ordinary batches large while giving long replies a bounded number of calls.
-const MAX_SLOT_BATCH_CHARS = 4800;
+// A long request can exceed the provider/proxy request timeout (524). The
+// per-request character budget is the user's maxCharsPerFragment setting;
+// requests that still time out are halved down to this size.
+const DEFAULT_MAX_REQUEST_CHARS = 1800;
 const MIN_524_SPLIT_CHARS = 900;
 
 // ---------------------------------------------------------------------------
@@ -86,7 +96,7 @@ function defaultFeatureSettings() {
         autoInject: false,
         autoPlay: false,
         gapMs: 250,
-        maxCharsPerFragment: 1800,
+        maxCharsPerFragment: DEFAULT_MAX_REQUEST_CHARS,
         slots: makeDefaultSlots(),
         presets: {},
         activePreset: '',
@@ -231,6 +241,10 @@ function buildContextAwareInstructionBlock(slots, options = {}) {
 // ---------------------------------------------------------------------------
 
 let voiceCache = null;
+// What the server's /generate-native-tts accepts. A server without the
+// extended route takes one text, voice and style per request.
+let routeCapabilities = { turns: false, maxSpeakers: 1 };
+let warnedOutdatedRoute = false;
 
 async function fetchVoices() {
     if (voiceCache) return voiceCache;
@@ -243,9 +257,14 @@ async function fetchVoices() {
         if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const json = await response.json();
         voiceCache = Array.isArray(json.voices) ? json.voices : [];
+        routeCapabilities = {
+            turns: json.capabilities?.turns === true,
+            maxSpeakers: Math.min(2, Math.max(1, Number(json.capabilities?.maxSpeakers) || 1)),
+        };
     } catch (err) {
+        // Not cached, so the next call retries.
         console.warn(`${LOG_PREFIX} Failed to load voices:`, err);
-        voiceCache = [];
+        return [];
     }
     return voiceCache;
 }
@@ -258,30 +277,83 @@ async function fetchVoices() {
 const fragmentCache = new Map();
 /** messageHash -> { url, blob } (one assembled response) */
 const assembledCache = new Map();
+/** messageHashes whose audio is being generated right now */
+const generating = new Set();
 
 function slotById(id) {
     return cfg().slots.find(s => s.id === Number(id));
 }
 
 /**
- * Synthesize a single fragment via SillyTavern's Google TTS route.
+ * The voice that reads a slot's lines: its own, else the narrator's, else any
+ * configured voice, so a line is never dropped for a missing assignment.
+ */
+function voiceForSlot(slotId) {
+    const own = slotById(slotId)?.voiceName?.trim();
+    if (own) return own;
+    const fallback = slotById(cfg().narratorSlot)?.voiceName?.trim()
+        || cfg().slots.find(slot => slot.voiceName?.trim())?.voiceName.trim();
+    if (fallback) console.warn(`${LOG_PREFIX} Slot ${slotId} has no voice; using ${fallback} for its lines.`);
+    return fallback || '';
+}
+
+/**
+ * Turn a message into ordered speech turns — narration and dialogue in reading
+ * order, each with the voice and delivery style that should read it.
+ */
+function buildTurns(rawText) {
+    const c = cfg();
+    const { segments, warnings } = parseVoiceMarkup(prepareSpeechText(rawText), { narratorSlot: c.narratorSlot, maxSlots: MAX_SLOTS });
+    for (const w of warnings) console.debug(`${LOG_PREFIX} ${w}`);
+
+    const structured = supportsStructuredTurns(activeModel());
+    return extractSpeakableSegments(segments, { mode: c.narrationMode, narratorSlot: c.narratorSlot })
+        .flatMap(segment => splitVoiceSegment(segment, maxRequestChars()))
+        .map(segment => ({
+            slot: segment.slot,
+            text: segment.text,
+            voice: voiceForSlot(segment.slot),
+            // A cue the AI wrote for this line wins over the slot's baseline.
+            // Older preview models take no style at all.
+            style: structured ? (segment.style || slotById(segment.slot)?.stylePrompt?.trim() || '') : '',
+        }));
+}
+
+function maxRequestChars() {
+    return Math.max(100, Number(cfg().maxCharsPerFragment) || DEFAULT_MAX_REQUEST_CHARS);
+}
+
+/**
+ * Ordered turns with two voices per request need the extended server route
+ * and a model that understands per-turn metadata (Gemini 3.8+).
+ */
+function usesTurnsRoute() {
+    return routeCapabilities.turns && supportsStructuredTurns(activeModel());
+}
+
+function toPayload(turns, turnsRoute) {
+    const model = activeModel();
+    if (turnsRoute) return buildGeminiTurnsPayload(turns, { model });
+    // The plain route reads one text with one voice and one style; packTurns
+    // only groups turns that share both.
+    return buildGeminiTtsPayload({
+        text: turns.map(turn => turn.text).join('\n'),
+        voice: turns[0].voice,
+        model,
+        instruction: turns[0].style,
+    });
+}
+
+/**
+ * Synthesize one request (a run of ordered turns) via SillyTavern's Google
+ * TTS route.
  * @returns {Promise<ArrayBuffer>}
  */
-async function synthesizeFragment(fragment) {
-    const slot = slotById(fragment.slot) || slotById(cfg().narratorSlot);
-    const voice = slot?.voiceName || '';
-    const instruction = slot?.stylePrompt || '';
-    const model = activeModel();
-    const gapMs = cfg().gapMs;
-
-    if (!voice) {
-        throw new Error(`Slot ${fragment.slot} has no voice assigned.`);
-    }
-
-    const cacheKey = makeVoiceCacheKey({ text: fragment.text, slot: fragment.slot, voice, model, instruction, gapMs });
+async function synthesizeRequest(turns, turnsRoute) {
+    const payload = toPayload(turns, turnsRoute);
+    const cacheKey = makeVoiceCacheKey(payload);
     if (fragmentCache.has(cacheKey)) return fragmentCache.get(cacheKey);
 
-    const payload = buildGeminiTtsPayload({ text: fragment.text, voice, model, instruction, api: 'makersuite' });
     const useReverseProxy = oai_settings.reverse_proxy && isValidUrl(oai_settings.reverse_proxy);
 
     const response = await fetch('/api/google/generate-native-tts', {
@@ -339,62 +411,60 @@ function parseRetryAfter(headerValue, message = '') {
 const sleep = (ms) => new Promise(res => setTimeout(res, ms));
 
 /**
- * Synthesize one fragment, waiting out rate limits instead of aborting. Reports
+ * Split a request that keeps timing out: between turns when it has several,
+ * otherwise inside its single turn. Returns null when it is too small to be
+ * worth splitting.
+ */
+function splitTurnsForRetry(turns) {
+    const chars = turns.reduce((sum, turn) => sum + turn.text.length, 0);
+    if (chars < MIN_524_SPLIT_CHARS) return null;
+    if (turns.length > 1) {
+        let cut = 0;
+        let running = 0;
+        while (cut < turns.length - 1 && running + turns[cut].text.length <= chars / 2) {
+            running += turns[cut].text.length;
+            cut++;
+        }
+        cut = Math.max(1, cut);
+        return [turns.slice(0, cut), turns.slice(cut)];
+    }
+    const pieces = splitVoiceSegment(turns[0], Math.ceil(turns[0].text.length / 2));
+    return pieces.length > 1 ? pieces.map(piece => [piece]) : null;
+}
+
+/**
+ * Synthesize one request, waiting out rate limits instead of aborting. Reports
  * a 'waiting' beat through onBeat so the UI can show the countdown; retries with
  * exponential backoff (capped) until it succeeds or hits a non-retryable error.
  */
-function splitTextForRequest(fragment, maxChars) {
-    const limit = Math.max(100, Number(maxChars) || MAX_SLOT_BATCH_CHARS);
-    const text = String(fragment?.text ?? '');
-    if (text.length <= limit) return text ? [{ slot: fragment.slot, text }] : [];
-
-    const pieces = [];
-    let remaining = text;
-    while (remaining.length > limit) {
-        // Prefer paragraph/line boundaries, then whitespace. This preserves
-        // the blank-line pauses used between merged quotes whenever possible.
-        let cut = remaining.lastIndexOf('\n', limit);
-        if (cut < Math.floor(limit * 0.5)) cut = remaining.lastIndexOf(' ', limit);
-        if (cut < Math.floor(limit * 0.5)) cut = limit;
-        const piece = remaining.slice(0, cut).trim();
-        if (piece) pieces.push({ slot: fragment.slot, text: piece });
-        remaining = remaining.slice(cut).trimStart();
-    }
-    if (remaining) pieces.push({ slot: fragment.slot, text: remaining });
-    return pieces;
-}
-
-async function synthesizeFragmentResilient(fragment, onBeat, recoveryDepth = 0) {
+async function synthesizeRequestResilient(turns, turnsRoute, onBeat, recoveryDepth = 0) {
     let attempt = 0;
     for (;;) {
         try {
-            return await synthesizeFragment(fragment);
+            return await synthesizeRequest(turns, turnsRoute);
         } catch (err) {
             // 524 is normally a proxy timeout for a request whose generated
-            // audio is too long. Retry once for a transient timeout; if it
-            // persists, split only this batch and stitch its pieces back
-            // together. This keeps short/normal batches at one request per
-            // slot without allowing one long slot to discard all quote audio.
+            // audio is too long. Retry for a transient timeout; if it
+            // persists, split only this request and stitch its parts back
+            // together, keeping the turns in order.
             if (err.status === 524) {
                 if (attempt < 2) {
                     attempt++;
                     const waitMs = 3000;
-                    console.debug(`${LOG_PREFIX} fragment hit 524; retrying in ${waitMs}ms (attempt ${attempt})`);
+                    console.debug(`${LOG_PREFIX} request hit 524; retrying in ${waitMs}ms (attempt ${attempt})`);
                     onBeat?.(waitMs);
                     await sleep(waitMs);
                     continue;
                 }
 
-                if (fragment.text.length >= MIN_524_SPLIT_CHARS && recoveryDepth < 4) {
-                    const pieces = splitTextForRequest(fragment, Math.ceil(fragment.text.length / 2));
-                    if (pieces.length > 1) {
-                        console.warn(`${LOG_PREFIX} fragment still timed out; splitting into ${pieces.length} smaller requests`);
-                        const buffers = [];
-                        for (const piece of pieces) {
-                            buffers.push(await synthesizeFragmentResilient(piece, onBeat, recoveryDepth + 1));
-                        }
-                        return concatWavBuffers(buffers, { gapMs: 0 });
+                const parts = recoveryDepth < 4 ? splitTurnsForRetry(turns) : null;
+                if (parts) {
+                    console.warn(`${LOG_PREFIX} request still timed out; splitting into ${parts.length} smaller requests`);
+                    const buffers = [];
+                    for (const part of parts) {
+                        buffers.push(await synthesizeRequestResilient(part, turnsRoute, onBeat, recoveryDepth + 1));
                     }
+                    return concatWavBuffers(buffers, { gapMs: 0 });
                 }
                 throw err;
             }
@@ -403,52 +473,11 @@ async function synthesizeFragmentResilient(fragment, onBeat, recoveryDepth = 0) 
             attempt++;
             const backoff = Math.min(2000 * 2 ** (attempt - 1), 32000);
             const waitMs = Math.max(err.retryAfterMs || 0, backoff);
-            console.debug(`${LOG_PREFIX} fragment hit ${err.status}; waiting ${waitMs}ms (attempt ${attempt})`);
+            console.debug(`${LOG_PREFIX} request hit ${err.status}; waiting ${waitMs}ms (attempt ${attempt})`);
             onBeat?.(waitMs);
             await sleep(waitMs);
         }
     }
-}
-
-/**
- * Collapse the parsed transcript into one request per voice slot.
- *
- * This deliberately operates on parsed segments rather than the quote-only
- * result: unmarked prose belongs to the narrator slot and is also collected
- * into one request. The first-seen slot order is retained for audio assembly.
- * Once a slot's audio is generated, its individual lines cannot be
- * re-interleaved with another slot without making separate requests, so this
- * is the intentional request-minimizing mode.
- *
- * @param {Array<{slot:number,text:string}>} segments
- * @returns {Array<{slot:number,text:string}>}
- */
-function batchSegmentsBySlot(segments) {
-    const batches = new Map();
-    for (const segment of segments || []) {
-        if (!segment) continue;
-        const text = String(segment.text ?? '').trim();
-        if (!text) continue;
-
-        const slot = Number(segment.slot);
-        const previous = batches.get(slot);
-        if (previous) {
-            previous.text += `${SLOT_BATCH_SEPARATOR}${text}`;
-        } else {
-            batches.set(slot, { slot, text });
-        }
-    }
-    return [...batches.values()];
-}
-
-/**
- * Keep the normal one-request-per-slot behavior, but pre-split long slot
- * batches before they reach the proxy timeout boundary. A single unusually
- * long quote is split at a word/line boundary as well.
- */
-function prepareRequestBatches(segments) {
-    return batchSegmentsBySlot(segments)
-        .flatMap(fragment => splitTextForRequest(fragment, MAX_SLOT_BATCH_CHARS));
 }
 
 /**
@@ -457,31 +486,46 @@ function prepareRequestBatches(segments) {
  * wait. Returns an object URL, or null if nothing to speak.
  */
 async function buildAudioForMessage(rawText, onProgress) {
-    const c = cfg();
-    const { segments, warnings } = parseVoiceMarkup(rawText, { narratorSlot: c.narratorSlot, maxSlots: MAX_SLOTS });
-    for (const w of warnings) console.debug(`${LOG_PREFIX} ${w}`);
+    await fetchVoices(); // learns which request shape the server accepts
+    const turns = buildTurns(rawText);
+    if (turns.length === 0) return null;
+    if (turns.some(turn => !turn.voice)) {
+        throw new Error('No voice assigned. Pick a voice for the narrator or a character slot.');
+    }
 
-    // One request per used slot: narrator prose (unmarked text) is collected
-    // with all other narrator prose, while each marked speaker gets one batch.
-    // Do not split at the old per-quote limit. Only oversized whole-slot
-    // batches are split, keeping normal responses at roughly one request per
-    // used voice slot while avoiding 524 timeouts on long replies.
-    const fragments = prepareRequestBatches(segments);
-    if (fragments.length === 0) return null;
+    // Narration and dialogue stay in reading order. With the extended route a
+    // request carries two voices, so a narrator plus one character is one
+    // request per reply; a third voice starts the next request.
+    const turnsRoute = usesTurnsRoute();
+    if (voiceCache && !routeCapabilities.turns && supportsStructuredTurns(activeModel()) && !warnedOutdatedRoute) {
+        warnedOutdatedRoute = true;
+        window.toastr?.warning(`Enhanced TTS: SillyTavern's TTS route is outdated, so each request carries one voice (more requests). ${OUTDATED_ROUTE_HINT}`);
+    }
+    const requests = packTurns(turns, {
+        maxSpeakers: turnsRoute ? routeCapabilities.maxSpeakers : 1,
+        maxChars: maxRequestChars(),
+        perTurnStyle: turnsRoute,
+    });
+    console.debug(`${LOG_PREFIX} ${turns.length} turn(s) in ${requests.length} request(s):`, requests.map(request => ({
+        voices: [...new Set(request.map(turn => turn.voice))],
+        turns: request.length,
+        chars: request.reduce((sum, turn) => sum + turn.text.length, 0),
+    })));
 
-    const total = fragments.length;
+    const total = requests.length;
     let done = 0;
     onProgress?.(done, total);
 
-    // Synthesize the first-seen slot batches with a small concurrency cap.
+    // Synthesize with a small concurrency cap, keeping each result in its slot.
     // Rate limits (429) are waited out, not thrown — a slow reply beats a dead one.
     const buffers = new Array(total);
     let next = 0;
     async function worker() {
         while (next < total) {
             const index = next++;
-            buffers[index] = await synthesizeFragmentResilient(
-                fragments[index],
+            buffers[index] = await synthesizeRequestResilient(
+                requests[index],
+                turnsRoute,
                 (waitingMs) => onProgress?.(done, total, { waitingMs }),
             );
             done++;
@@ -490,7 +534,7 @@ async function buildAudioForMessage(rawText, onProgress) {
     }
     await Promise.all(Array.from({ length: Math.min(SYNTH_CONCURRENCY, total) }, worker));
 
-    const wav = concatWavBuffers(buffers, { gapMs: c.gapMs });
+    const wav = concatWavBuffers(buffers, { gapMs: cfg().gapMs });
     const blob = new Blob([wav], { type: 'audio/wav' });
     return URL.createObjectURL(blob);
 }
@@ -507,7 +551,25 @@ function stopPlayback() {
 }
 
 function msgHash(rawText) {
-    return String(getStringHash(String(rawText ?? '')));
+    const c = cfg();
+    // Include the voice routing configuration so an audio file made before a
+    // slot was fixed/configured cannot mask the corrected quote audio.
+    const routing = (c.slots || []).map(slot => ({
+        id: slot.id,
+        enabled: !!slot.enabled,
+        voiceName: slot.voiceName || '',
+        stylePrompt: slot.stylePrompt || '',
+    }));
+    return String(getStringHash(JSON.stringify({
+        version: ASSEMBLED_CACHE_VERSION,
+        text: String(rawText ?? ''),
+        model: activeModel(),
+        narrationMode: c.narrationMode,
+        narratorSlot: c.narratorSlot,
+        gapMs: c.gapMs,
+        maxChars: maxRequestChars(),
+        routing,
+    })));
 }
 
 function getMessageEl(messageId) {
@@ -588,6 +650,11 @@ async function playMessage(messageId, { forcePlay = true } = {}) {
         return;
     }
 
+    // Auto-play racing a click (or a double click) on the same reply must not
+    // pay for the same requests twice; the running generation plays when done.
+    if (generating.has(hash)) return;
+    generating.add(hash);
+
     try {
         setButtonState($btn, 'busy', 'Generating…', 'starting…');
         const url = await buildAudioForMessage(rawText, (done, total, info) => {
@@ -612,6 +679,8 @@ async function playMessage(messageId, { forcePlay = true } = {}) {
         console.error(`${LOG_PREFIX} Synthesis failed:`, err);
         setButtonState($btn, 'error', `TTS error: ${err.message}`, 'error');
         window.toastr?.error(`Enhanced TTS: ${err.message}`);
+    } finally {
+        generating.delete(hash);
     }
 }
 
@@ -619,7 +688,7 @@ async function playMessage(messageId, { forcePlay = true } = {}) {
 // Display cleanup (strip markup/expression tags from the rendered message)
 // ---------------------------------------------------------------------------
 
-const MARKER_PROBE_RE = /\[\/?v\d+\]|<\/?[a-z][a-z0-9 _-]{0,30}>/i;
+const MARKER_PROBE_RE = /\[\/?v\d+(?:\s*:[^\]\n]*)?\]|<\/?[a-z][a-z0-9 _-]{0,30}>/i;
 
 /**
  * Walk a message's rendered text nodes and strip voice markers + expression
@@ -643,7 +712,7 @@ function cleanRenderedMessage(messageId) {
 // Event handlers
 // ---------------------------------------------------------------------------
 
-function onMessageRendered(messageId) {
+function onMessageRendered(messageId, { autoPlay = false } = {}) {
     const c = cfg();
     if (!c?.enabled) return;
     const id = Number(messageId);
@@ -652,7 +721,9 @@ function onMessageRendered(messageId) {
     cleanRenderedMessage(id);
     ensureReplayButton(id);
 
-    if (c.autoPlay) {
+    // Only new character replies auto-play; voicing the user's own message
+    // would spend quota on text they just typed. Its button still works.
+    if (autoPlay && c.autoPlay) {
         // Fire-and-forget; progress shows on the button.
         playMessage(id, { forcePlay: true });
     }
@@ -693,11 +764,12 @@ const settingsHtml = `
     </label>
 </div>
 <small class="textAlignCenter" style="display:block">
-    The AI wraps dialogue in <code>[v2]"line"[/v2]</code> markers; each slot is
-    voiced separately and all fragments are stitched into one audio file per
-    reply. Use the <i>Copy AI instructions</i> button (or auto-inject) to teach
-    the model the markup. Requires a Google AI Studio key saved in your
-    connection settings.
+    The AI wraps dialogue in <code>[v2]"line"[/v2]</code> markers (optionally with
+    a delivery cue: <code>[v2: whispering]</code>). Narration and dialogue are
+    read in order, two voices per request — a narrator plus one character is a
+    single request per reply — and stitched into one audio file. Use the
+    <i>Copy AI instructions</i> button (or auto-inject) to teach the model the
+    markup. Requires a Google AI Studio key saved in your connection settings.
 </small>
 
 <div class="flex-container flexFlowColumn marginTopBot5">
@@ -707,6 +779,7 @@ const settingsHtml = `
         <option value="openai" disabled>OpenAI-compatible (coming soon)</option>
         <option value="custom" disabled>Custom (coming soon)</option>
     </select>
+    <small id="enh_tts_route_status" style="display:block; opacity:0.85"></small>
 </div>
 
 <div class="flex-container flexFlowColumn marginTopBot5">
@@ -726,8 +799,8 @@ const settingsHtml = `
 <div class="flex-container flexFlowColumn marginTopBot5">
     <label for="enh_tts_mode">Narration scope</label>
     <select id="enh_tts_mode" class="text_pole">
-        <option value="quotes">Quotes only — speak wrapped dialogue</option>
-        <option value="audiobook">Audiobook — also read prose (narrator slot)</option>
+        <option value="quotes">Quotes only — speak dialogue (unwrapped quotes use the narrator voice)</option>
+        <option value="audiobook">Audiobook — narrator reads prose, characters speak their lines</option>
     </select>
 </div>
 
@@ -750,8 +823,14 @@ const settingsHtml = `
 </div>
 
 <div class="flex-container flexFlowColumn marginTopBot5">
-    <label for="enh_tts_gap">Gap between fragments (ms)</label>
+    <label for="enh_tts_gap">Pause between requests (ms)</label>
     <input type="number" id="enh_tts_gap" class="text_pole" min="0" max="3000" step="50" />
+</div>
+
+<div class="flex-container flexFlowColumn marginTopBot5">
+    <label for="enh_tts_max_chars">Max characters per request</label>
+    <input type="number" id="enh_tts_max_chars" class="text_pole" min="300" max="20000" step="100" />
+    <small>Higher = fewer requests for long replies. Lower it if you get 524 timeouts (e.g. behind Cloudflare).</small>
 </div>
 
 <div class="flex-container marginTopBot5">
@@ -764,11 +843,13 @@ const settingsHtml = `
 <hr>
 <h4>Voice slots</h4>
 <small class="textAlignCenter" style="display:block">
-    Assign a label (character) and a Gemini voice to each slot. The optional
-    style is a <i>short</i> delivery cue — e.g. "weary, slow" or "whispering" —
-    sent as turn-level direction (<code>speech_metadata.style</code>), so it steers
-    the voice <b>without being read aloud</b>. Keep it brief; long "director's
-    notes" cause voice drift. Disabled slots are omitted from the AI instructions.
+    Assign a label (character) and a Gemini voice to each slot. The voice
+    carries the character; the optional style is a <i>short</i> baseline
+    delivery cue — e.g. "weary, slow" — sent as turn-level direction
+    (<code>speech_metadata.style</code>), so it is <b>not read aloud</b>. Leave it
+    empty for the most natural delivery; a per-line cue the AI writes
+    (<code>[v2: furious]</code>) replaces it for that line. Long "director's notes"
+    cause voice drift. Disabled slots are omitted from the AI instructions.
 </small>
 <div id="enh_tts_slots"></div>
 
@@ -849,6 +930,22 @@ async function renderSlots() {
         $(this).find('.enh_tts_slot_label').val(slot.label || '');
         $(this).find('.enh_tts_slot_style').val(slot.stylePrompt || '');
     });
+    updateRouteStatus();
+}
+
+const OUTDATED_ROUTE_HINT = 'Apply enhanced-tts-server.patch to SillyTavern\'s src/endpoints/google.js and restart the server.';
+
+/** Show whether the server route can take two voices per request. */
+function updateRouteStatus() {
+    const $status = $('#enh_tts_route_status');
+    if (!voiceCache) {
+        $status.text('⚠ Could not reach /api/google/list-native-voices — check that SillyTavern is running.');
+    } else if (routeCapabilities.turns) {
+        $status.text('Server route: multi-voice ready — up to two voices, each line with its own style, per request.');
+    } else {
+        $status.text('⚠ Server route is outdated: each request carries one voice, so replies take more requests '
+            + `and per-line cues may be ignored. ${OUTDATED_ROUTE_HINT}`);
+    }
 }
 
 function populateNarratorSelect() {
@@ -880,6 +977,7 @@ function loadSettings() {
     $('#enh_tts_autoplay').prop('checked', c.autoPlay);
     $('#enh_tts_autoinject').prop('checked', c.autoInject);
     $('#enh_tts_gap').val(c.gapMs);
+    $('#enh_tts_max_chars').val(maxRequestChars());
     populateModelSelect();
     populateNarratorSelect();
     populatePresetSelect();
@@ -897,6 +995,7 @@ function onGlobalChange() {
     c.autoPlay = $('#enh_tts_autoplay').is(':checked');
     c.autoInject = $('#enh_tts_autoinject').is(':checked');
     c.gapMs = Math.max(0, Number($('#enh_tts_gap').val()) || 0);
+    c.maxCharsPerFragment = Math.max(300, Number($('#enh_tts_max_chars').val()) || DEFAULT_MAX_REQUEST_CHARS);
     $('#enh_tts_custom_model_row').toggle(c.useCustomModel);
     saveSettingsDebounced();
 }
@@ -952,7 +1051,7 @@ function applyPreset(preset) {
     c.narrationMode = preset.narrationMode === 'audiobook' ? 'audiobook' : 'quotes';
     c.narratorSlot = Number(preset.narratorSlot) || 1;
     c.gapMs = Math.max(0, Number(preset.gapMs) || 0);
-    c.maxCharsPerFragment = Number(preset.maxCharsPerFragment) || 1800;
+    c.maxCharsPerFragment = Number(preset.maxCharsPerFragment) || DEFAULT_MAX_REQUEST_CHARS;
     c.slots = makeDefaultSlots().map((slot, i) => ({ ...slot, ...(preset.slots[i] || {}), id: i + 1 }));
     return true;
 }
@@ -1084,6 +1183,8 @@ export function init(contentContainer) {
         .on('change', onGlobalChange);
     $('#enh_tts_custom_model').on('input', onGlobalChange);
     $('#enh_tts_gap').on('input', onGlobalChange);
+    // 'change', not 'input': a half-typed number would be clamped mid-edit.
+    $('#enh_tts_max_chars').on('change', onGlobalChange);
 
     // Slot editor (delegated — rows are rebuilt on preset load)
     $('#enh_tts_slots')
@@ -1118,8 +1219,8 @@ export function init(contentContainer) {
     });
 
     // Message lifecycle
-    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageRendered);
-    eventSource.on(event_types.USER_MESSAGE_RENDERED, onMessageRendered);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, (messageId) => onMessageRendered(messageId, { autoPlay: true }));
+    eventSource.on(event_types.USER_MESSAGE_RENDERED, (messageId) => onMessageRendered(messageId));
     eventSource.on(event_types.CHAT_COMPLETION_PROMPT_READY, onPromptReady);
     eventSource.on(event_types.CHAT_CHANGED, () => stopPlayback());
 

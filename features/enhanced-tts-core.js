@@ -3,6 +3,7 @@
  * by importing this file directly under `node --test`.
  *
  * Voice routing recognizes only wrapper markers of the form  [vN] ... [/vN].
+ * An opener may carry a short per-line delivery cue:  [vN: whispering] ... [/vN].
  * Square brackets are used deliberately so they can never be confused with
  * Gemini's angle-bracket expression tags (<gasp>, <sigh>, <laugh>, ...). Those
  * expression tags are ordinary text here: they ride along inside a quote to the
@@ -10,8 +11,15 @@
  * by stripExpressionTags().
  */
 
-// Matches an opening [vN] or closing [/vN] voice marker.
-const VOICE_MARKER_RE = /\[(\/?)v(\d+)\]/gi;
+// Matches an opening [vN] / [vN: cue] or closing [/vN] voice marker.
+const VOICE_MARKER_RE = /\[(\/?)v(\d+)(?:\s*:\s*([^\]\n]{0,200}))?\]/gi;
+
+// Gemini drifts on long style strings; a per-line cue is a few words at most.
+const MAX_STYLE_CHARS = 100;
+
+// Quoted dialogue left outside any voice marker: straight, curly, guillemet
+// and low-high quotes. Used so quotes-only mode never drops unwrapped lines.
+const UNMARKED_QUOTE_RE = /"[^"\n]+"|“[^”\n]+”|«[^»\n]+»|„[^“”\n]+[“”]/g;
 
 // Matches short angle-bracket expression tags such as <gasp>, <sigh>,
 // <heavy breath>, <short pause>, </laugh>. Deliberately narrow: the tag name
@@ -21,19 +29,46 @@ const EXPRESSION_TAG_RE = /<\/?[a-z][a-z0-9 _-]{0,30}>/gi;
 
 const DEFAULT_MAX_SLOTS = 10;
 
-// Keep separately parsed fragments from running together when they are packed
-// after filtering (for example, when narrator prose is omitted in quotes mode).
-// This separator is part of the text and therefore part of maxCharsPerFragment.
-const VOICE_FRAGMENT_SEPARATOR = '\n';
+// HTML elements a chat message may contain. Angle-bracket tags that are not on
+// this list (<gasp>, <short pause>, ...) are Gemini expression tags and stay.
+const HTML_TAG_RE = /<\/?(?:a|abbr|b|big|blockquote|br|center|cite|code|del|div|em|font|h[1-6]|hr|i|img|ins|kbd|li|mark|ol|p|pre|q|s|small|span|strike|strong|sub|sup|table|tbody|td|th|thead|tr|u|ul)\b[^>]*>/gi;
+
+/**
+ * Turn a chat message into a speakable transcript. Gemini reads its input
+ * verbatim, so drop what is never read aloud (code, collapsed <details>,
+ * comments, images) and formatting characters (markdown emphasis, HTML tags,
+ * link syntax). Voice markers and expression tags are kept.
+ * @param {string} input
+ * @returns {string}
+ */
+export function prepareSpeechText(input) {
+    return String(input ?? '')
+        .replace(/```[\s\S]*?(?:```|$)/g, ' ')
+        .replace(/<!--[\s\S]*?-->/g, ' ')
+        .replace(/<(details|style|script)\b[^>]*>[\s\S]*?<\/\1>/gi, ' ')
+        .replace(HTML_TAG_RE, ' ')
+        .replace(/!\[[^\]\n]*\]\([^)\n]*\)/g, ' ')
+        .replace(/\[(?!\/?v\d)([^\]\n]+)\]\([^)\n]*\)/gi, '$1')
+        .replace(/`([^`\n]*)`/g, '$1')
+        .replace(/\*+|~~/g, '')
+        .replace(/(?<![\p{L}\p{N}])_+|_+(?![\p{L}\p{N}])/gu, '')
+        .replace(/^[ \t]*(?:#{1,6}[ \t]+|>[ \t]?)/gm, '')
+        .replace(/^[ \t]*(?:-[ \t]*){3,}$/gm, '')
+        .replace(/[ \t]{2,}/g, ' ')
+        .replace(/^[ \t]+|[ \t]+$/gm, '')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+}
 
 /**
  * Parse voice markers while assigning unmarked text to the narrator slot.
  * The parser is a scanner, not an HTML parser: arbitrary expression tags must
- * survive unchanged in the text handed to a provider.
+ * survive unchanged in the text handed to a provider. A cue on an opener
+ * ([v2: angry]) becomes that segment's `style`.
  *
  * @param {string} input
  * @param {{narratorSlot?: number, maxSlots?: number}} [options]
- * @returns {{segments: Array<{slot: number, text: string}>, warnings: string[]}}
+ * @returns {{segments: Array<{slot: number, text: string, style?: string}>, warnings: string[]}}
  */
 export function parseVoiceMarkup(input, options = {}) {
     const maxSlots = Number.isInteger(options.maxSlots) ? options.maxSlots : DEFAULT_MAX_SLOTS;
@@ -42,16 +77,17 @@ export function parseVoiceMarkup(input, options = {}) {
     const segments = [];
     const warnings = [];
     let activeSlot = narratorSlot;
+    let activeStyle = '';
     let cursor = 0;
     let openSlot = null;
 
-    const pushText = (text, slot) => {
+    const pushText = (text, slot, style) => {
         if (!text) return;
-        segments.push({ slot, text });
+        segments.push(style ? { slot, text, style } : { slot, text });
     };
 
     for (const match of source.matchAll(VOICE_MARKER_RE)) {
-        pushText(source.slice(cursor, match.index), activeSlot);
+        pushText(source.slice(cursor, match.index), activeSlot, activeStyle);
         const marker = match[0];
         const isClosing = match[1] === '/';
         const parsedSlot = Number(match[2]);
@@ -68,20 +104,24 @@ export function parseVoiceMarkup(input, options = {}) {
             }
             openSlot = parsedSlot;
             activeSlot = parsedSlot;
+            activeStyle = normalizeStyle(match[3]);
         } else if (openSlot === null) {
             warnings.push(`Closing marker for slot ${parsedSlot} had no matching opener.`);
             activeSlot = narratorSlot;
+            activeStyle = '';
         } else if (openSlot !== parsedSlot) {
             warnings.push(`Voice slot ${openSlot} was closed by slot ${parsedSlot}.`);
             openSlot = null;
             activeSlot = narratorSlot;
+            activeStyle = '';
         } else {
             openSlot = null;
             activeSlot = narratorSlot;
+            activeStyle = '';
         }
     }
 
-    pushText(source.slice(cursor), activeSlot);
+    pushText(source.slice(cursor), activeSlot, activeStyle);
 
     if (openSlot !== null) {
         warnings.push(`Voice slot ${openSlot} was not explicitly closed.`);
@@ -125,50 +165,70 @@ export function cleanForDisplay(input) {
 }
 
 /**
- * Merge adjacent text using the same slot without trimming meaningful text.
- * @param {Array<{slot:number,text:string}>} segments
- * @returns {Array<{slot:number,text:string}>}
+ * Merge adjacent text using the same slot and style without trimming
+ * meaningful text.
+ * @param {Array<{slot:number,text:string,style?:string}>} segments
+ * @returns {Array<{slot:number,text:string,style?:string}>}
  */
 export function mergeVoiceSegments(segments) {
     const merged = [];
     for (const segment of segments || []) {
         if (!segment || !String(segment.text ?? '')) continue;
+        const style = segment.style || '';
         const previous = merged.at(-1);
-        if (previous && previous.slot === segment.slot) {
+        if (previous && previous.slot === segment.slot && (previous.style || '') === style) {
             previous.text += segment.text;
         } else {
-            merged.push({ slot: segment.slot, text: String(segment.text) });
+            merged.push(withStyle({ slot: segment.slot, text: String(segment.text) }, style));
         }
     }
     return merged;
 }
 
 /**
- * Select the segments that should actually be synthesized.
- *  - 'quotes'   : only segments routed to a non-narrator slot (wrapped dialogue)
+ * Select the segments that should actually be synthesized, in reading order.
+ *  - 'quotes'   : dialogue only — wrapped lines, plus quoted text the model
+ *                 forgot to wrap (voiced by the narrator slot), so no line is lost
  *  - 'audiobook': every segment with speakable text, narrator prose included
- * Segments whose text is only whitespace are dropped either way.
+ * Text is trimmed; segments without a letter or digit are dropped either way.
  *
- * @param {Array<{slot:number,text:string}>} segments
+ * @param {Array<{slot:number,text:string,style?:string}>} segments
  * @param {{mode?: 'quotes'|'audiobook', narratorSlot?: number}} [options]
- * @returns {Array<{slot:number,text:string}>}
+ * @returns {Array<{slot:number,text:string,style?:string}>}
  */
 export function extractSpeakableSegments(segments, options = {}) {
     const mode = options.mode === 'audiobook' ? 'audiobook' : 'quotes';
     const narratorSlot = Number(options.narratorSlot ?? 1);
     const result = [];
+    const keep = (slot, text, style) => {
+        const trimmed = text.trim();
+        if (hasSpeakableContent(trimmed)) result.push(withStyle({ slot, text: trimmed }, style));
+    };
     for (const segment of segments || []) {
         if (!segment) continue;
         const text = String(segment.text ?? '');
-        if (!text.trim()) continue;
-        if (mode === 'quotes' && segment.slot === narratorSlot) continue;
-        result.push({ slot: segment.slot, text });
+        if (mode === 'quotes' && segment.slot === narratorSlot) {
+            for (const quote of text.match(UNMARKED_QUOTE_RE) || []) keep(narratorSlot, quote, segment.style);
+            continue;
+        }
+        keep(segment.slot, text, segment.style);
     }
     return result;
 }
 
 /**
- * Split a segment at whitespace boundaries while keeping its order.
+ * True when the text has something to pronounce (a letter or digit), as
+ * opposed to stray punctuation or emphasis markers left between quotes.
+ * @param {string} text
+ */
+export function hasSpeakableContent(text) {
+    return /[\p{L}\p{N}]/u.test(String(text ?? ''));
+}
+
+/**
+ * Split an over-long segment while keeping its order and other fields.
+ * Splits prefer a sentence or line end, then whitespace, so the voice does not
+ * break off mid-word.
  * @param {{slot:number,text:string}} segment
  * @param {number} [maxChars]
  * @returns {Array<{slot:number,text:string}>}
@@ -176,47 +236,62 @@ export function extractSpeakableSegments(segments, options = {}) {
 export function splitVoiceSegment(segment, maxChars = 1800) {
     const limit = Math.max(100, Number(maxChars) || 1800);
     const text = String(segment?.text ?? '');
-    if (text.length <= limit) return text ? [{ slot: segment.slot, text }] : [];
+    if (text.length <= limit) return text ? [{ ...segment, text }] : [];
 
     const pieces = [];
     let remaining = text;
     while (remaining.length > limit) {
-        let cut = remaining.lastIndexOf(' ', limit);
-        if (cut < Math.floor(limit * 0.5)) cut = remaining.lastIndexOf('\n', limit);
-        if (cut < Math.floor(limit * 0.5)) cut = limit;
-        pieces.push({ slot: segment.slot, text: remaining.slice(0, cut) });
-        remaining = remaining.slice(cut).replace(/^\s+/, '');
+        const cut = findSplitPoint(remaining, limit);
+        const piece = remaining.slice(0, cut).trim();
+        if (piece) pieces.push({ ...segment, text: piece });
+        remaining = remaining.slice(cut).trimStart();
     }
-    if (remaining) pieces.push({ slot: segment.slot, text: remaining });
+    if (remaining.trim()) pieces.push({ ...segment, text: remaining });
     return pieces;
 }
 
 /**
- * Expand and split parsed segments for the synthesis queue.
- * @param {Array<{slot:number,text:string}>} segments
- * @param {number} [maxChars]
+ * Pack ordered turns into as few TTS requests as possible without reordering
+ * anything. A request is closed when the next turn would add a voice beyond
+ * `maxSpeakers` (Gemini's multi-speaker mode takes two) or push it past
+ * `maxChars`. With `perTurnStyle: false` (a route that takes one style per
+ * request) a style change closes the request too.
+ *
+ * Greedy packing gives the fewest requests: every run of turns inside a valid
+ * request is itself valid, so extending each request as far as possible is
+ * never worse than closing it early.
+ *
+ * @template {{voice:string,text:string,style?:string}} T
+ * @param {T[]} turns
+ * @param {{maxSpeakers?: number, maxChars?: number, perTurnStyle?: boolean}} [options]
+ * @returns {T[][]}
  */
-export function prepareVoiceSegments(segments, maxChars = 1800) {
-    const packed = [];
-    for (const segment of segments || []) {
-        if (!segment) continue;
-        const text = String(segment.text ?? '');
-        if (!text) continue;
+export function packTurns(turns, options = {}) {
+    const maxSpeakers = Math.max(1, Math.floor(Number(options.maxSpeakers)) || 1);
+    const maxChars = Math.max(100, Number(options.maxChars) || 1800);
+    const perTurnStyle = options.perTurnStyle !== false;
+    const requests = [];
+    let current = null;
+    let voices = new Set();
+    let chars = 0;
 
-        const previous = packed.at(-1);
-        if (previous && previous.slot === segment.slot) {
-            // Create a new object rather than appending to an input or output
-            // object that a caller may still hold.
-            packed[packed.length - 1] = {
-                slot: previous.slot,
-                text: previous.text + VOICE_FRAGMENT_SEPARATOR + text,
-            };
-        } else {
-            packed.push({ slot: segment.slot, text });
+    for (const turn of turns || []) {
+        if (!turn?.text) continue;
+        const fits = current !== null
+            && (voices.has(turn.voice) || voices.size < maxSpeakers)
+            && chars + turn.text.length <= maxChars
+            && (perTurnStyle || (current[0].style || '') === (turn.style || ''));
+        if (!fits) {
+            current = [];
+            requests.push(current);
+            voices = new Set();
+            chars = 0;
         }
+        current.push(turn);
+        voices.add(turn.voice);
+        chars += turn.text.length;
     }
-
-    return packed.flatMap(segment => splitVoiceSegment(segment, maxChars));
+    return requests;
 }
 
 /**
@@ -245,17 +320,56 @@ export function buildGeminiTtsPayload(input) {
 }
 
 /**
- * Deterministic cache key for a single synthesized fragment.
+ * Build a request for the extended native route: ordered `turns` (one Gemini
+ * part each, with its own speech_metadata.style) and, when two voices are
+ * involved, a `speakers` list for Gemini's multi-speaker mode. This keeps
+ * narration and the quotes inside it in one request, in reading order.
+ *
+ * @param {Array<{voice:string,text:string,style?:string}>} turns  at most two distinct voices
+ * @param {{model:string, api?:string}} options
  */
-export function makeVoiceCacheKey({ text, slot, voice, model, instruction, gapMs }) {
+export function buildGeminiTurnsPayload(turns, options = {}) {
+    const list = (turns || []).filter(turn => turn?.text);
+    const voices = [...new Set(list.map(turn => String(turn.voice ?? '')))];
+    if (voices.length > 2) throw new Error('A Gemini TTS request supports at most two voices');
+    const multi = voices.length === 2;
+    const names = speakerNames(voices);
+
+    return {
+        model: String(options.model ?? ''),
+        api: options.api || 'makersuite',
+        voice: multi ? '' : (voices[0] ?? ''),
+        speakers: multi ? voices.map((voice, i) => ({ speaker: names[i], voice })) : [],
+        turns: list.map(turn => {
+            const part = { text: String(turn.text), style: String(turn.style ?? '').trim() };
+            if (multi) part.speaker = names[voices.indexOf(String(turn.voice ?? ''))];
+            return part;
+        }),
+    };
+}
+
+/**
+ * Gemini 3.8+ TTS models take per-turn speech_metadata (style, speaker). The
+ * older previews take plain text only and get one voice per request.
+ * @param {string} model
+ */
+export function supportsStructuredTurns(model) {
+    const name = String(model ?? '').trim().replace(/^models\//i, '');
+    return !/^gemini-(?:1\.|2\.|3\.[0-7](?!\d))/i.test(name);
+}
+
+/**
+ * Deterministic cache key for one synthesized request payload.
+ */
+export function makeVoiceCacheKey(payload) {
     return JSON.stringify({
-        version: 2,
-        text: String(text ?? ''),
-        slot: Number(slot),
-        voice: String(voice ?? ''),
-        model: String(model ?? ''),
-        instruction: String(instruction ?? ''),
-        gapMs: Number(gapMs) || 0,
+        version: 3,
+        model: String(payload?.model ?? ''),
+        voice: String(payload?.voice ?? ''),
+        text: String(payload?.text ?? ''),
+        style: String(payload?.style ?? ''),
+        speakers: payload?.speakers ?? [],
+        turns: payload?.turns ?? [],
     });
 }
 
@@ -282,17 +396,24 @@ export function buildInstructionBlock(slots, options = {}) {
 
     return [
         '[Voice narration markup]',
-        'When you write dialogue, wrap each spoken line in a voice-slot marker so it can be',
-        'narrated with the right voice. Use square-bracket wrappers exactly like this:',
+        'Wrap every spoken line of dialogue in a voice-slot marker so it is read aloud in',
+        'that speaker\'s voice. Use square-bracket wrappers exactly like this:',
         '',
         '    [v2]"You shouldn\'t be here."[/v2]',
         '',
+        'When the delivery matters, add a short cue after a colon in the opening marker:',
+        '',
+        '    [v2: whispering urgently]"Get down. <short pause> Now."[/v2]',
+        '',
         'Rules:',
-        '  - Open with [vN] and close with [/vN], where N is the slot number for the speaker.',
-        '  - Wrap only the spoken words (keep the quotation marks inside the wrapper).',
+        '  - Open with [vN] or [vN: cue] and close with [/vN], where N is the speaker\'s slot number.',
+        '  - Wrap every quoted line, even short ones; keep the quotation marks inside the wrapper.',
         '  - Leave narration/prose outside any marker; it belongs to the narrator slot.',
-        '  - You may use expression tags inside a quote for delivery, e.g. <gasp>, <sigh>,',
-        '    <laugh>, <breath>, <short pause>. Write them in angle brackets, never square ones.',
+        '  - A cue is 1-4 English words about delivery only: emotion, pace, volume or tone',
+        '    (e.g. "furious, shouting", "barely audible", "teasing", "out of breath").',
+        '    Never put age, gender, accent or names in a cue; the voice already carries them.',
+        '  - For moments inside a line use angle-bracket tags: <gasp>, <sigh>, <laugh>, <chuckle>,',
+        '    <breath>, <cough>, <sob>, <short pause>, <long pause>. Never square brackets for these.',
         '  - Do not nest voice markers. Close one speaker before opening the next.',
         '',
         'Voice slots:',
@@ -432,4 +553,40 @@ function writeTag(bytes, offset, tag) {
 function normalizeSlot(value, maxSlots) {
     const slot = Number(value);
     return Number.isInteger(slot) && slot >= 1 && slot <= maxSlots ? slot : null;
+}
+
+function normalizeStyle(value) {
+    return String(value ?? '').replace(/\s+/g, ' ').trim().slice(0, MAX_STYLE_CHARS);
+}
+
+function withStyle(segment, style) {
+    return style ? { ...segment, style } : segment;
+}
+
+// Prefer the end of a sentence or line in the back half of the window, then
+// any whitespace, so a split never lands mid-word unless it must. A space
+// inside an expression tag (<short pause>) is not a split point.
+function findSplitPoint(text, limit) {
+    const floor = Math.floor(limit * 0.5);
+    const head = text.slice(0, limit + 1);
+    let sentenceEnd = -1;
+    for (const match of head.matchAll(/[.!?…]+["'”»’)]*(?=\s)|\n/g)) {
+        const cut = match[0] === '\n' ? match.index : match.index + match[0].length;
+        if (cut <= limit) sentenceEnd = cut;
+    }
+    if (sentenceEnd >= floor) return sentenceEnd;
+
+    let space = head.lastIndexOf(' ', limit);
+    const tagStart = space > 0 ? text.lastIndexOf('<', space) : -1;
+    const tag = tagStart === -1 ? null : /^<\/?[a-z][a-z0-9 _-]{0,30}>/i.exec(text.slice(tagStart));
+    if (tag && tagStart + tag[0].length > space) space = text.lastIndexOf(' ', tagStart - 1);
+    return space >= floor ? space : limit;
+}
+
+// Speaker labels only need to be unique within one request; the voice name is
+// readable in logs and already alphanumeric for Gemini's prebuilt voices.
+function speakerNames(voices) {
+    const names = voices.map((voice, i) => voice.replace(/[^A-Za-z0-9]/g, '') || `Speaker${i + 1}`);
+    if (names.length === 2 && names[0] === names[1]) names[1] += '2';
+    return names;
 }
