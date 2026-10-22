@@ -7,6 +7,7 @@ import { countTokensOpenAIAsync } from '../../../../tokenizers.js';
 import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, compileNotes, addWriterNotes, runAgents, reorderSlots } from './story-agents-core.js';
 import { presetPrompts, presetKey, cleanPresetMetadata, excludePresetPrompts, installPresetTracking } from './story-agents-presets.js';
 import { readAgentResponse } from './story-agents-stream.js';
+import { fetchWriterWithRetries } from './story-agents-writer.js';
 
 const ROUTE = '/api/backends/chat-completions/generate';
 const SUPPORTED_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
@@ -147,6 +148,8 @@ function renderSlots() {
             card.querySelector('summary').textContent = `${index + 1}. ${current?.name || 'Unnamed agent'}${current?.enabled ? '' : ' (disabled)'}`;
         };
         checkbox(card, 'Select this agent by default', slot.enabled, v => update('enabled', v));
+        checkbox(card, 'Isolated agent (ignore earlier agents\' notes)', slot.isolated, v => update('isolated', v));
+        card.append(element('p', 'enh_sa_hint', 'Isolation keeps preset, lore and chat context. This agent\'s finished notes still go to the writer and to later agents that allow shared notes.'));
         field(card, 'Name', slot.name, v => update('name', v));
         field(card, 'Activity shown while working', slot.activity, v => update('activity', v));
         field(card, 'Specialist prompt (SillyTavern macros supported)', slot.prompt, v => update('prompt', v), { type: 'textarea' });
@@ -224,6 +227,8 @@ function renderSettings(contentContainer) {
     const writer = element('details', 'enh_sa_slot');
     writer.append(element('summary', '', 'Final writer instructions'));
     field(writer, 'How the writer should use the notes', cfg().writerPrompt, value => { cfg().writerPrompt = value; save(); }, { type: 'textarea' });
+    field(writer, 'Retries for final writer request', cfg().writerMaxRetries, value => { cfg().writerMaxRetries = value; save(); }, { type: 'number', min: 0, max: 5, step: 1 });
+    writer.append(element('p', 'enh_sa_hint', 'Retries temporary API failures and accepted requests that return no story yet. Keeps finished agent notes and uses the configured retry delay. Set to 0 to disable.'));
     root.append(writer);
     const list = element('div');
     list.id = 'enh_sa_slots';
@@ -350,7 +355,7 @@ function renderProgress(run) {
             card = element('details', 'enh_sa_result');
             card.dataset.agent = result.slot.id;
             const heading = element('summary');
-            const skip = button('Skip agent', event => {
+            const skip = button('Skip', event => {
                 event.preventDefault();
                 event.stopPropagation();
                 if (!result.controller || !['queued', 'working', 'retrying'].includes(result.status)) return;
@@ -528,9 +533,19 @@ async function interceptedFetch(input, init) {
         run.phase = 'writer';
         run.message = notes && decision === 'notes' ? 'Notes finished. Writing the story response…' : 'Writing the story response without agent notes…';
         renderProgress(run);
-        const response = await previousFetch(input, { ...init, body: JSON.stringify(body), signal });
+        const writerMessage = run.message;
+        const response = await fetchWriterWithRetries(previousFetch, input, { ...init, body: JSON.stringify(body) }, {
+            signal, maxRetries: config.writerMaxRetries, retryDelayMs: config.retryDelaySeconds * 1000, generationType: body.type,
+            onAttempt: attempt => {
+                run.message = attempt === 1 ? writerMessage : `Writing the story response, attempt ${attempt} of ${config.writerMaxRetries + 1}…`;
+                renderProgress(run);
+            },
+            onRetry: (error, attempt, delay) => {
+                run.message = `${errorMessage(error)} Retrying writer in ${Math.ceil(delay / 1000)}s (attempt ${attempt} of ${config.writerMaxRetries + 1}).`;
+                renderProgress(run);
+            },
+        });
         signal.throwIfAborted();
-        if (!response.ok) throw new Error(`Writer API request failed (${response.status}).`);
         run.responseReturned = true;
         return response;
     } catch (error) {
@@ -569,8 +584,9 @@ function injectStyles() {
         .enh_sa_result[data-status="done"] { border-color:#739879; }
         .enh_sa_result[data-status="failed"] { border-color:#c07869; }
         .enh_sa_result summary { display:flex; align-items:center; gap:8px; }
-        .enh_sa_agent_status { flex:1; }
-        .enh_sa_result summary button { flex-shrink:0; font-size:.8em; margin:0; }
+        .enh_sa_agent_status { flex:1 1 0; min-width:0; }
+        #enh_sa_progress button { width:auto; min-width:max-content; white-space:nowrap; word-break:normal; overflow-wrap:normal; flex-shrink:0; }
+        #enh_sa_progress .enh_sa_result summary button { flex:0 0 auto; width:auto; min-width:3.5em; height:auto; white-space:nowrap; word-break:normal; overflow-wrap:normal; font-size:.8em; margin:0; padding:4px 8px; }
     `;
     document.head.append(style);
 }

@@ -1388,6 +1388,8 @@ async function interceptedFetch(input, init) {
 
     let ctx;
     try {
+        const writerType = init?.[Symbol.for('enhancements.storyWriterGenerationType')];
+        if (typeof writerType === 'string') pendingGenerationType = writerType.toLowerCase();
         ctx = prepareRequest(body);
     } catch (err) {
         console.error(`${LOG_PREFIX} prepare failed, passing through:`, err);
