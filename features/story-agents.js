@@ -2,9 +2,11 @@
 import { extension_settings } from '../../../../extensions.js';
 import { saveSettingsDebounced, getRequestHeaders, sendTextareaMessage, isGenerating, stopGeneration, substituteParams } from '../../../../../script.js';
 import { eventSource, event_types } from '../../../../events.js';
-import { oai_settings, createGenerationParameters, getChatCompletionModel } from '../../../../openai.js';
+import { oai_settings, createGenerationParameters, getChatCompletionModel, promptManager, Message, ChatCompletion } from '../../../../openai.js';
 import { countTokensOpenAIAsync } from '../../../../tokenizers.js';
-import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, extractNotes, compileNotes, addWriterNotes, runAgents } from './story-agents-core.js';
+import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, compileNotes, addWriterNotes, runAgents, reorderSlots } from './story-agents-core.js';
+import { presetPrompts, presetKey, cleanPresetMetadata, excludePresetPrompts, installPresetTracking } from './story-agents-presets.js';
+import { readAgentResponse } from './story-agents-stream.js';
 
 const ROUTE = '/api/backends/chat-completions/generate';
 const SUPPORTED_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
@@ -15,6 +17,7 @@ let activeRun = null;
 let lastRun = null;
 let clockTimer = null;
 let preparingSend = false;
+let draggedSlot = null;
 
 function cfg() { return extension_settings.enhancements.storyAgents; }
 function ensureDefaults() {
@@ -70,12 +73,72 @@ function save() {
     saveSettingsDebounced();
 }
 
+function renderPresetExclusions() {
+    const list = document.getElementById('enh_sa_preset_prompts');
+    if (!list) return;
+    const key = presetKey(oai_settings);
+    document.getElementById('enh_sa_preset_name').textContent = `Preset: ${key}`;
+    list.replaceChildren();
+    const prompts = presetPrompts(promptManager);
+    const ignored = cfg().ignoredPresetPrompts[key] ?? [];
+    for (const prompt of prompts) {
+        const row = element('div', 'enh_sa_choice');
+        const position = prompt.injection_position === 1 ? `In chat, depth ${prompt.injection_depth ?? 4}, priority ${prompt.injection_order ?? 100}` : 'Preset order';
+        checkbox(row, prompt.name || prompt.identifier, ignored.includes(prompt.identifier), checked => {
+            const ids = new Set(cfg().ignoredPresetPrompts[key] ?? []);
+            if (checked) ids.add(prompt.identifier); else ids.delete(prompt.identifier);
+            cfg().ignoredPresetPrompts[key] = [...ids];
+            save();
+        });
+        row.append(element('small', 'enh_sa_hint', `${prompt.role || 'system'} · ${position}${prompt.enabled ? '' : ' · disabled in preset'}`));
+        list.append(row);
+    }
+    if (!prompts.length) list.append(element('p', 'enh_sa_hint', 'Select a chat and a Chat Completion preset to list its prompts.'));
+}
+
+function moveSlot(source, target, after = false) {
+    cfg().slots = reorderSlots(cfg().slots, source, target, after);
+    save();
+    renderSlots();
+}
+
 function renderSlots() {
     const list = document.getElementById('enh_sa_slots');
     list.replaceChildren();
     cfg().slots.forEach((slot, index) => {
         const card = element('details', 'enh_sa_slot');
-        card.append(element('summary', '', `${index + 1}. ${slot.name || 'Unnamed agent'}${slot.enabled ? '' : ' (disabled)'}`));
+        card.dataset.slot = slot.id;
+        const summary = element('summary', '', `${index + 1}. ${slot.name || 'Unnamed agent'}${slot.enabled ? '' : ' (disabled)'}`);
+        summary.draggable = true;
+        summary.title = 'Drag to change agent priority';
+        summary.addEventListener('dragstart', event => {
+            draggedSlot = slot.id;
+            event.dataTransfer.setData('text/plain', slot.id);
+            event.dataTransfer.effectAllowed = 'move';
+        });
+        summary.addEventListener('dragend', () => { draggedSlot = null; list.querySelectorAll('.enh_sa_drop').forEach(n => n.classList.remove('enh_sa_drop')); });
+        card.addEventListener('dragover', event => {
+            if (!draggedSlot || draggedSlot === slot.id) return;
+            event.preventDefault();
+            event.dataTransfer.dropEffect = 'move';
+            card.classList.add('enh_sa_drop');
+        });
+        card.addEventListener('dragleave', () => card.classList.remove('enh_sa_drop'));
+        card.addEventListener('drop', event => {
+            if (!draggedSlot) return;
+            event.preventDefault();
+            const after = event.clientY > card.getBoundingClientRect().top + card.getBoundingClientRect().height / 2;
+            moveSlot(draggedSlot, slot.id, after);
+            draggedSlot = null;
+        });
+        card.append(summary);
+        const priority = element('div', 'enh_sa_actions');
+        const up = button('Move up', () => moveSlot(slot.id, cfg().slots[index - 1]?.id));
+        const down = button('Move down', () => moveSlot(slot.id, cfg().slots[index + 1]?.id, true));
+        up.disabled = index === 0;
+        down.disabled = index === cfg().slots.length - 1;
+        priority.append(up, down);
+        card.append(priority);
         // Find by ID on each edit: normalization replaces the settings object.
         const update = (key, value) => {
             const current = cfg().slots.find(s => s.id === slot.id);
@@ -110,13 +173,30 @@ function renderSettings(contentContainer) {
         if (!value) { pendingSelection = null; cancelRun(); choosing?.cancel(); }
     });
     checkbox(root, 'Choose agents before each response', cfg().askEveryTime, value => { cfg().askEveryTime = value; save(); });
+    checkbox(root, 'Stream agent responses', cfg().streamAgents, value => { cfg().streamAgents = value; save(); });
+    root.append(element('p', 'enh_sa_hint', 'Agents run in slot order. Each sees completed notes from earlier agents while working only on its own task. Drag a slot heading to change priority, or use Move up / Move down. Streaming shows notes as they arrive.'));
     root.append(element('p', 'enh_sa_hint', 'Each selected agent makes one extra API request using the current connection. Blank models use the chat model. The final writer uses your normal chat settings.'));
     root.append(element('p', 'enh_sa_hint', 'Agents inherit the assembled preset and activated lorebook messages with their roles, order and depth placements, plus the current prompt post-processing.'));
     const row = element('div', 'enh_sa_grid');
-    for (const [key, label, min, max] of [['concurrency', 'Agents at once', 1, 4], ['timeoutSeconds', 'Timeout per agent (seconds)', 15, 600], ['maxNoteChars', 'Max note characters per agent', 200, 8000]]) {
+    for (const [key, label, min, max] of [['timeoutSeconds', 'Timeout per attempt (seconds)', 15, 600], ['maxNoteChars', 'Max note characters per agent', 200, 8000], ['maxRetries', 'Retries per agent', 0, 5], ['retryDelaySeconds', 'Retry delay (seconds)', 1, 30]]) {
         field(row, label, cfg()[key], value => { cfg()[key] = value; save(); }, { type: 'number', min, max, step: 1 });
     }
     root.append(row);
+    root.append(element('p', 'enh_sa_hint', 'Retries restart a failed request, up to the selected count, with increasing delay. They can add API charges. Skip cancels one agent; Cancel response stops the whole chain.'));
+    const exclusions = element('details', 'enh_sa_slot');
+    exclusions.append(element('summary', '', 'Preset prompts ignored by agents'));
+    exclusions.append(element('p', 'enh_sa_hint', 'Check prompts to omit from every specialist request. Selections are saved separately for each preset. The final writer keeps the full preset. Lorebook, character and chat markers remain included.'));
+    const presetName = element('b');
+    presetName.id = 'enh_sa_preset_name';
+    const presetList = element('div');
+    presetList.id = 'enh_sa_preset_prompts';
+    exclusions.append(presetName, presetList, button('Refresh preset prompts', renderPresetExclusions), button('Include all preset prompts', () => {
+        cfg().ignoredPresetPrompts[presetKey(oai_settings)] = [];
+        save();
+        renderPresetExclusions();
+    }));
+    exclusions.addEventListener('toggle', () => { if (exclusions.open) renderPresetExclusions(); });
+    root.append(exclusions);
     const post = element('details', 'enh_sa_slot');
     post.append(element('summary', '', 'Final post instructions for every agent'));
     post.append(element('p', 'enh_sa_hint', 'Appended after all preset messages and the specialist task. Controls agent notes; the final story writer has its own instructions below.'));
@@ -166,6 +246,7 @@ function renderSettings(contentContainer) {
     root.append(actions);
     contentContainer.append(root);
     renderSlots();
+    renderPresetExclusions();
 }
 
 async function selectAgents() {
@@ -181,7 +262,7 @@ async function selectAgents() {
         const row = element('div', 'enh_sa_choice');
         const input = checkbox(row, slot.name || 'Unnamed agent', slot.enabled && !!slot.prompt.trim(), () => {});
         input.disabled = !slot.prompt.trim();
-        row.append(element('small', 'enh_sa_hint', slot.prompt.trim() ? slot.activity : 'Add a prompt in Enhancements settings to use this slot.'));
+        row.append(element('small', 'enh_sa_hint', slot.prompt.trim() ? `${checks.length + 1}. ${slot.activity}` : 'Add a prompt in Enhancements settings to use this slot.'));
         checks.push({ input, slot });
         dialog.append(row);
     }
@@ -268,13 +349,26 @@ function renderProgress(run) {
         if (!card) {
             card = element('details', 'enh_sa_result');
             card.dataset.agent = result.slot.id;
-            card.append(element('summary'), element('pre', 'enh_sa_notes'));
+            const heading = element('summary');
+            const skip = button('Skip agent', event => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (!result.controller || !['queued', 'working', 'retrying'].includes(result.status)) return;
+                result.controller.abort(abortError('Agent skipped'));
+                result.status = 'skipped';
+                result.notes = '';
+                result.error = 'Skipped by you.';
+                renderProgress(run);
+            });
+            heading.append(element('span', 'enh_sa_agent_status'), skip);
+            card.append(heading, element('pre', 'enh_sa_notes'));
             rows.append(card);
         }
         const elapsed = result.started ? ` (${Math.floor(((result.finished || Date.now()) - result.started) / 1000)}s)` : '';
-        const status = { queued: 'Queued', working: result.slot.activity || 'Preparing notes', done: 'Finished', failed: 'Failed', cancelled: 'Cancelled' }[result.status];
-        card.querySelector('summary').textContent = `${result.slot.name} — ${status}${elapsed}`;
+        const status = { queued: 'Queued', working: result.slot.activity || 'Preparing notes', retrying: 'Waiting to retry', done: 'Finished', failed: 'Failed', cancelled: 'Cancelled', skipped: 'Skipped' }[result.status];
+        card.querySelector('span').textContent = `${result.slot.name} — ${status}${result.attempt > 1 ? ` · attempt ${result.attempt}` : ''}${elapsed}`;
         card.querySelector('pre').textContent = result.error || result.notes || 'Waiting for finished notes…';
+        card.querySelector('button').hidden = !['queued', 'working', 'retrying'].includes(result.status) || run.phase !== 'agents';
         card.dataset.status = result.status;
     }
 }
@@ -305,34 +399,42 @@ async function fitWriterContext(messages, notes, maxTokens, signal) {
     return candidate;
 }
 
-async function executeAgent(slot, request, config, signal, connectionSettings) {
+async function executeAgent(slot, request, config, signal, connectionSettings, onNotes, previousResults, agentBase) {
     const settings = structuredClone(connectionSettings);
     settings.openai_max_tokens = slot.maxTokens;
     settings.temp_openai = slot.temperature;
-    settings.stream_openai = false;
+    settings.stream_openai = config.streamAgents;
     settings.show_thoughts = false;
     settings.enable_web_search = false;
     settings.request_images = false;
     const model = slot.model.trim() || request.model || getChatCompletionModel(settings);
     const budget = Number(settings.openai_max_context) - slot.maxTokens - 256;
-    const agentMessages = buildAgentMessages(request.messages, slot, substituteParams, config);
-    signal.throwIfAborted();
-    const count = await countTokensOpenAIAsync(agentMessages, true);
-    if (!Number.isFinite(count)) throw new Error('Could not count the agent context.');
-    if (count > budget) throw new Error('Not enough context for this agent. Reduce output tokens or increase the chat context size. Preset messages have been kept in place.');
+    let agentMessages;
+    try {
+        agentMessages = buildAgentMessages(agentBase, slot, substituteParams, config, previousResults);
+        signal.throwIfAborted();
+        const count = await countTokensOpenAIAsync(agentMessages, true);
+        if (!Number.isFinite(count)) throw new Error('Could not count the agent context.');
+        if (count > budget) throw new Error('Not enough context for this agent. Reduce output tokens or increase the chat context size. Preset messages have been kept in place.');
+    } catch (error) { error.retryable = false; throw error; }
     let modelParameters = null;
     if (model !== request.model) {
         settings.function_calling = false;
         ({ generate_data: modelParameters } = await createGenerationParameters(settings, model, 'quiet', structuredClone(agentMessages)));
     }
-    const generate_data = buildAgentRequest(request, agentMessages, slot, modelParameters);
+    const generate_data = buildAgentRequest(request, agentMessages, slot, modelParameters, config.streamAgents);
+    const requestSignal = AbortSignal.any([signal, AbortSignal.timeout(config.timeoutSeconds * 1000)]);
     const response = await previousFetch(ROUTE, {
         method: 'POST', headers: getRequestHeaders(), body: JSON.stringify(generate_data),
-        signal: AbortSignal.any([signal, AbortSignal.timeout(config.timeoutSeconds * 1000)]),
+        signal: requestSignal,
         [AGENT_REQUEST]: true,
     });
-    if (!response.ok) throw new Error(`Agent API request failed (${response.status}).`);
-    return extractNotes(await response.json());
+    if (!response.ok) {
+        const error = new Error(`Agent API request failed (${response.status}).`);
+        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
+        throw error;
+    }
+    return readAgentResponse(response, requestSignal, onNotes, config.streamAgents);
 }
 
 async function reviewFailure(run, message, allowNotes = true) {
@@ -355,9 +457,15 @@ async function reviewFailure(run, message, allowNotes = true) {
 
 async function interceptedFetch(input, init) {
     const url = typeof input === 'string' ? input : input?.url || '';
-    if (!cfg()?.enabled || init?.[AGENT_REQUEST] || !url.includes(ROUTE) || typeof init?.body !== 'string') return previousFetch(input, init);
+    if (init?.[AGENT_REQUEST] || !url.includes(ROUTE) || typeof init?.body !== 'string') return previousFetch(input, init);
     let body;
     try { body = JSON.parse(init.body); } catch { return previousFetch(input, init); }
+    const sourceMessages = body.messages;
+    if (Array.isArray(body.messages)) {
+        body.messages = cleanPresetMetadata(body.messages);
+        init = { ...init, body: JSON.stringify(body) };
+    }
+    if (!cfg()?.enabled) return previousFetch(input, init);
     if (!SUPPORTED_TYPES.has(body.type) || !Array.isArray(body.messages) || body.json_schema) return previousFetch(input, init);
     if (activeRun) throw new Error('A story response is already in progress.');
     let selection = pendingSelection;
@@ -384,12 +492,19 @@ async function interceptedFetch(input, init) {
     clearInterval(clockTimer);
     clockTimer = setInterval(() => renderProgress(run), 1000);
     try {
+        let agentBase;
+        let baseError;
+        try { agentBase = excludePresetPrompts(sourceMessages, config.ignoredPresetPrompts[presetKey(connectionSettings)] ?? []); }
+        catch (error) { error.retryable = false; baseError = error; }
         run.results = await runAgents(selection.slots, {
-            concurrency: config.concurrency, signal,
-            execute: slot => executeAgent(slot, body, config, signal, connectionSettings),
+            signal, maxRetries: config.maxRetries, retryDelayMs: config.retryDelaySeconds * 1000,
+            execute: (slot, onNotes, previous, agentSignal) => {
+                if (baseError) throw baseError;
+                return executeAgent(slot, body, config, agentSignal, connectionSettings, onNotes, previous, agentBase);
+            },
             onUpdate: (result, results) => {
-                if (result.status === 'working') result.started ??= Date.now();
-                else if (result.status !== 'queued') result.finished ??= Date.now();
+                if (result?.status === 'working') result.started ??= Date.now();
+                else if (result && ['done', 'failed', 'skipped', 'cancelled'].includes(result.status)) result.finished ??= Date.now();
                 run.results = results;
                 renderProgress(run);
             },
@@ -441,6 +556,8 @@ function injectStyles() {
         .enh_sa_actions button { margin:0; }
         .enh_sa_slot, .enh_sa_result { border:1px solid var(--SmartThemeBorderColor,#777); border-radius:8px; padding:10px; margin:8px 0; }
         .enh_sa_slot summary, .enh_sa_result summary { cursor:pointer; overflow-wrap:anywhere; }
+        .enh_sa_slot summary[draggable] { cursor:grab; }
+        .enh_sa_slot.enh_sa_drop { outline:2px solid var(--SmartThemeBodyColor,#eee); }
         .enh_sa_picker { box-sizing:border-box; width:min(540px,94vw); max-height:85vh; overflow:auto; padding:20px; border-radius:12px; background:var(--SmartThemeBlurTintColor,#242424); color:var(--SmartThemeBodyColor,#eee); border:1px solid var(--SmartThemeBorderColor,#777); }
         .enh_sa_picker::backdrop { background:rgba(0,0,0,.55); }
         .enh_sa_choice { display:flex; flex-direction:column; gap:3px; padding:8px 0; }
@@ -451,12 +568,16 @@ function injectStyles() {
         .enh_sa_minimized .enh_sa_results { display:none; }
         .enh_sa_result[data-status="done"] { border-color:#739879; }
         .enh_sa_result[data-status="failed"] { border-color:#c07869; }
+        .enh_sa_result summary { display:flex; align-items:center; gap:8px; }
+        .enh_sa_agent_status { flex:1; }
+        .enh_sa_result summary button { flex-shrink:0; font-size:.8em; margin:0; }
     `;
     document.head.append(style);
 }
 
 export function init(contentContainer) {
     ensureDefaults();
+    const hookManager = installPresetTracking({ getManager: () => promptManager, Message, ChatCompletion, enabled: () => cfg()?.enabled === true });
     injectStyles();
     renderSettings(contentContainer);
     mountProgress();
@@ -487,9 +608,13 @@ export function init(contentContainer) {
         activeRun = null;
     });
     eventSource.on(event_types.CHAT_CHANGED, () => {
+        hookManager();
+        renderPresetExclusions();
         pendingSelection = null;
         choosing?.cancel();
         cancelRun();
         document.getElementById('enh_sa_progress').hidden = true;
     });
+    if (event_types.OAI_PRESET_CHANGED_AFTER) eventSource.on(event_types.OAI_PRESET_CHANGED_AFTER, () => { hookManager(); renderPresetExclusions(); });
+    if (event_types.GENERATE_BEFORE_COMBINE_PROMPTS) eventSource.on(event_types.GENERATE_BEFORE_COMBINE_PROMPTS, hookManager);
 }

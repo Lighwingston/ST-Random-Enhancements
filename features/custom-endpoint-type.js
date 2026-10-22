@@ -787,10 +787,11 @@ function createAnthropicStreamTransform() {
     let buf = '';
     let evt = '';
     const enc = new TextEncoder();
+    const dec = new TextDecoder();
 
     return new TransformStream({
         transform(chunk, ctl) {
-            buf += new TextDecoder().decode(chunk).replace(/\r/g, '');
+            buf += dec.decode(chunk, { stream: true }).replace(/\r/g, '');
             const lines = buf.split('\n');
             buf = lines.pop() || '';
 
@@ -806,15 +807,15 @@ function createAnthropicStreamTransform() {
                             ctl.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
                         } else if (evt === 'message_stop') {
                             ctl.enqueue(enc.encode('data: [DONE]\n\n'));
+                        } else if (evt === 'error' || d.type === 'error') {
+                            ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: d.error || { message: d.message || 'Anthropic streaming error' } })}\n\n`));
                         }
                     } catch { /* skip */ }
                     evt = '';
                 }
             }
         },
-        flush(ctl) {
-            ctl.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-        },
+        // A disconnected stream is incomplete. Only message_stop emits DONE.
     });
 }
 
@@ -823,10 +824,11 @@ function createResponsesStreamTransform() {
     let buf = '';
     let evt = '';
     const enc = new TextEncoder();
+    const dec = new TextDecoder();
 
     return new TransformStream({
         transform(chunk, ctl) {
-            buf += new TextDecoder().decode(chunk).replace(/\r/g, '');
+            buf += dec.decode(chunk, { stream: true }).replace(/\r/g, '');
             const lines = buf.split('\n');
             buf = lines.pop() || '';
 
@@ -841,15 +843,15 @@ function createResponsesStreamTransform() {
                             ctl.enqueue(enc.encode(`data: ${JSON.stringify(out)}\n\n`));
                         } else if (evt === 'response.completed') {
                             ctl.enqueue(enc.encode('data: [DONE]\n\n'));
+                        } else if (['error', 'response.failed', 'response.incomplete'].includes(evt) || ['error', 'response.failed', 'response.incomplete'].includes(d.type)) {
+                            ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: d.error || d.response?.error || { message: d.message || 'Responses stream did not complete' } })}\n\n`));
                         }
                     } catch { /* skip */ }
                     evt = '';
                 }
             }
         },
-        flush(ctl) {
-            ctl.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
-        },
+        // Only the upstream completion event confirms successful output.
     });
 }
 
