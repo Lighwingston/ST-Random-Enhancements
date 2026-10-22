@@ -31,6 +31,7 @@ const FEATURES = [
     // unwraps the JSON response last.
     { name: 'StructuredPrefill', path: './features/structured-prefill.js' },
     { name: 'EnhancedTts', path: './features/enhanced-tts.js' },
+    { name: 'StoryAgents', path: './features/story-agents.js' },
     // { name: 'NextFeature', path: './features/next-feature.js' },
 ];
 

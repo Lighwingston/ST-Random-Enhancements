@@ -1367,6 +1367,9 @@ function needsBuffering(ctx, s) {
 const previousFetch = window.fetch;
 
 async function interceptedFetch(input, init) {
+    // Specialist notes use their own output instructions; keep the final
+    // writer's prefill and banned-word enforcement on the final request only.
+    if (init?.[Symbol.for('enhancements.storyAgent')]) return previousFetch(input, init);
     const url = typeof input === 'string' ? input : input?.url || '';
 
     const s = getSettings();
