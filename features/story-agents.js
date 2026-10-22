@@ -228,7 +228,7 @@ function renderSettings(contentContainer) {
     writer.append(element('summary', '', 'Final writer instructions'));
     field(writer, 'How the writer should use the notes', cfg().writerPrompt, value => { cfg().writerPrompt = value; save(); }, { type: 'textarea' });
     field(writer, 'Retries for final writer request', cfg().writerMaxRetries, value => { cfg().writerMaxRetries = value; save(); }, { type: 'number', min: 0, max: 5, step: 1 });
-    writer.append(element('p', 'enh_sa_hint', 'Retries temporary API failures and accepted requests that return no story yet. Keeps finished agent notes and uses the configured retry delay. Set to 0 to disable.'));
+    writer.append(element('p', 'enh_sa_hint', 'Automatically retries HTTP 402, temporary API failures and accepted requests that return no story yet. Keeps finished agent notes and uses the configured retry delay. Set to 0 to disable automatic retries. Failed writer requests always offer Retry writer or Cancel.'));
     root.append(writer);
     const list = element('div');
     list.id = 'enh_sa_slots';
@@ -460,6 +460,32 @@ async function reviewFailure(run, message, allowNotes = true) {
     });
 }
 
+async function reviewWriterFailure(run, error) {
+    run.phase = 'review';
+    run.message = `${errorMessage(error)} Finished agent notes are kept. Retry the writer or cancel the response.`;
+    renderProgress(run);
+    const panel = document.getElementById('enh_sa_progress');
+    panel.hidden = false;
+    panel.classList.remove('enh_sa_minimized');
+    const actions = element('div', 'enh_sa_actions');
+    actions.id = 'enh_sa_writer_recovery';
+    return new Promise(resolve => {
+        let settled = false;
+        const decide = value => {
+            if (settled) return;
+            settled = true;
+            actions.remove();
+            run.decision = null;
+            resolve(value);
+        };
+        run.decision = decide;
+        actions.append(button('Retry writer', () => decide('retry')),
+            button('Cancel', () => { decide(null); cancelRun(); }));
+        panel.append(actions);
+        if (run.signal.aborted) decide(null);
+    });
+}
+
 async function interceptedFetch(input, init) {
     const url = typeof input === 'string' ? input : input?.url || '';
     if (init?.[AGENT_REQUEST] || !url.includes(ROUTE) || typeof init?.body !== 'string') return previousFetch(input, init);
@@ -534,17 +560,29 @@ async function interceptedFetch(input, init) {
         run.message = notes && decision === 'notes' ? 'Notes finished. Writing the story response…' : 'Writing the story response without agent notes…';
         renderProgress(run);
         const writerMessage = run.message;
-        const response = await fetchWriterWithRetries(previousFetch, input, { ...init, body: JSON.stringify(body) }, {
-            signal, maxRetries: config.writerMaxRetries, retryDelayMs: config.retryDelaySeconds * 1000, generationType: body.type,
-            onAttempt: attempt => {
-                run.message = attempt === 1 ? writerMessage : `Writing the story response, attempt ${attempt} of ${config.writerMaxRetries + 1}…`;
-                renderProgress(run);
-            },
-            onRetry: (error, attempt, delay) => {
-                run.message = `${errorMessage(error)} Retrying writer in ${Math.ceil(delay / 1000)}s (attempt ${attempt} of ${config.writerMaxRetries + 1}).`;
-                renderProgress(run);
-            },
-        });
+        let response;
+        while (!response) {
+            run.phase = 'writer';
+            try {
+                response = await fetchWriterWithRetries(previousFetch, input, { ...init, body: JSON.stringify(body) }, {
+                    signal, maxRetries: config.writerMaxRetries, retryDelayMs: config.retryDelaySeconds * 1000, generationType: body.type,
+                    onAttempt: attempt => {
+                        run.message = attempt === 1 ? writerMessage : `Writing the story response, attempt ${attempt} of ${config.writerMaxRetries + 1}…`;
+                        renderProgress(run);
+                    },
+                    onRetry: (error, attempt, delay) => {
+                        run.message = `${errorMessage(error)} Retrying writer in ${Math.ceil(delay / 1000)}s (attempt ${attempt} of ${config.writerMaxRetries + 1}).`;
+                        renderProgress(run);
+                    },
+                });
+            } catch (error) {
+                signal.throwIfAborted();
+                if (error?.name === 'AbortError') throw error;
+                const choice = await reviewWriterFailure(run, error);
+                signal.throwIfAborted();
+                if (choice !== 'retry') throw abortError();
+            }
+        }
         signal.throwIfAborted();
         run.responseReturned = true;
         return response;

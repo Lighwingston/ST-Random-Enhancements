@@ -11,9 +11,35 @@ function wait(ms, signal) {
 
 function responseError(status, message, retryAfter) {
     const error = new Error(`Writer API request failed (${status}): ${message}`);
-    error.retryable = status >= 200 && status < 300 || [408, 425, 429].includes(status) || status >= 500;
+    error.retryable = status >= 200 && status < 300 || [402, 408, 425, 429].includes(status) || status >= 500;
     error.retryAfter = retryAfter;
     return error;
+}
+
+async function providerError(response) {
+    if (!response.body) return response.statusText || 'The provider did not return a successful response.';
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let text = '';
+    try {
+        while (text.length < 4096) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            text += decoder.decode(value, { stream: true });
+        }
+        text = (text + decoder.decode()).slice(0, 4096).trim();
+    } catch { /* Keep the HTTP status if the error body cannot be read. */ }
+    finally {
+        await reader.cancel().catch(() => {});
+        reader.releaseLock();
+    }
+    try {
+        const data = JSON.parse(text);
+        const message = data.error?.message || data.message || data.detail || data.error;
+        if (typeof message === 'string' && message.trim()) return message.trim().slice(0, 500);
+    } catch { /* Plain-text errors are common for proxy rejections. */ }
+    if (text && !text.startsWith('<')) return text.slice(0, 500);
+    return response.statusText || 'The provider did not return a successful response.';
 }
 
 function delayFromHeader(response) {
@@ -29,8 +55,7 @@ async function validateResponse(response) {
     const retryAfter = delayFromHeader(response);
     // Some wrappers report a stale .ok flag. HTTP status is authoritative.
     if (status < 200 || status >= 300) {
-        await response.body?.cancel().catch(() => {});
-        throw responseError(status, 'The provider did not return a successful response.', retryAfter);
+        throw responseError(status, await providerError(response), retryAfter);
     }
     const type = response.headers.get('content-type') || '';
     if (/text\/event-stream/i.test(type)) {
