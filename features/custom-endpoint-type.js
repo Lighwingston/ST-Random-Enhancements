@@ -25,7 +25,7 @@
  */
 
 import { extension_settings } from '../../../../extensions.js';
-import { saveSettingsDebounced } from '../../../../../script.js';
+import { saveSettingsDebounced, getRequestHeaders } from '../../../../../script.js';
 
 const SETTINGS_KEY = 'enhancements';
 const LOG_PREFIX  = '[Enhancements:CustomEndpointType]';
@@ -550,18 +550,22 @@ function transformRequestForMessages(body) {
     const messages = body.messages || [];
     const s = getSettings();
 
-    // Pull system messages out of the array
+    // Anthropic accepts a leading system block. Later system injections must
+    // stay at their chat positions, as user messages, like ST's native Claude
+    // converter. Collecting ALL systems here used to erase lorebook depths.
     const systemParts = [];
     const nonSystemMessages = [];
+    let leadingSystems = true;
     for (const m of messages) {
-        if (m.role === 'system') {
+        if (m.role === 'system' && leadingSystems) {
             if (typeof m.content === 'string') {
                 systemParts.push(m.content);
             } else if (Array.isArray(m.content)) {
                 systemParts.push(m.content.map(c => c.text || '').join(''));
             }
         } else {
-            nonSystemMessages.push(m);
+            leadingSystems = false;
+            nonSystemMessages.push(m.role === 'system' ? { ...m, role: 'user' } : m);
         }
     }
     body.messages = nonSystemMessages;
@@ -932,6 +936,22 @@ async function interceptedFetch(input, init) {
     const endpointType = getSettings().customEndpointType || 'chat_completions';
     if (endpointType === 'chat_completions') {
         return previousFetch(input, init);     // default — pass through
+    }
+
+    // The backend normally processes body.messages. /responses moves them
+    // into input and /messages splits out system messages before that happens.
+    // Use ST's own processor first, once, for both specialists and the writer.
+    if (body.custom_prompt_post_processing && Array.isArray(body.messages)) {
+        const processed = await previousFetch('/api/backends/chat-completions/process', {
+            method: 'POST', headers: getRequestHeaders(), signal: init.signal,
+            body: JSON.stringify({ type: body.custom_prompt_post_processing, messages: body.messages,
+                user_name: body.user_name, char_name: body.char_name, group_names: body.group_names }),
+        });
+        if (!processed.ok) throw new Error(`Prompt post-processing failed (${processed.status}).`);
+        const data = await processed.json();
+        if (!Array.isArray(data.messages)) throw new Error('Prompt post-processing returned no messages.');
+        body.messages = data.messages;
+        body.custom_prompt_post_processing = '';
     }
 
     const isStreaming = body.stream === true;

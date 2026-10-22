@@ -4,7 +4,7 @@ import { saveSettingsDebounced, getRequestHeaders, sendTextareaMessage, isGenera
 import { eventSource, event_types } from '../../../../events.js';
 import { oai_settings, createGenerationParameters, getChatCompletionModel } from '../../../../openai.js';
 import { countTokensOpenAIAsync } from '../../../../tokenizers.js';
-import { AGENT_REQUEST, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, extractNotes, compileNotes, addWriterNotes, dropOldestTurn, runAgents } from './story-agents-core.js';
+import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, extractNotes, compileNotes, addWriterNotes, runAgents } from './story-agents-core.js';
 
 const ROUTE = '/api/backends/chat-completions/generate';
 const SUPPORTED_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
@@ -111,11 +111,36 @@ function renderSettings(contentContainer) {
     });
     checkbox(root, 'Choose agents before each response', cfg().askEveryTime, value => { cfg().askEveryTime = value; save(); });
     root.append(element('p', 'enh_sa_hint', 'Each selected agent makes one extra API request using the current connection. Blank models use the chat model. The final writer uses your normal chat settings.'));
+    root.append(element('p', 'enh_sa_hint', 'Agents inherit the assembled preset and activated lorebook messages with their roles, order and depth placements, plus the current prompt post-processing.'));
     const row = element('div', 'enh_sa_grid');
     for (const [key, label, min, max] of [['concurrency', 'Agents at once', 1, 4], ['timeoutSeconds', 'Timeout per agent (seconds)', 15, 600], ['maxNoteChars', 'Max note characters per agent', 200, 8000]]) {
         field(row, label, cfg()[key], value => { cfg()[key] = value; save(); }, { type: 'number', min, max, step: 1 });
     }
     root.append(row);
+    const post = element('details', 'enh_sa_slot');
+    post.append(element('summary', '', 'Final post instructions for every agent'));
+    post.append(element('p', 'enh_sa_hint', 'Appended after all preset messages and the specialist task. Controls agent notes; the final story writer has its own instructions below.'));
+    const postRole = element('label', 'enh_sa_field');
+    postRole.append(element('span', '', 'Agent post instruction role'));
+    const roleSelect = element('select', 'text_pole');
+    for (const role of ['system', 'user']) {
+        const option = element('option', '', role === 'system' ? 'System' : 'User');
+        option.value = role;
+        roleSelect.append(option);
+    }
+    roleSelect.value = cfg().agentPostRole;
+    roleSelect.addEventListener('change', () => { cfg().agentPostRole = roleSelect.value; save(); });
+    postRole.append(roleSelect);
+    post.append(postRole);
+    const postInput = field(post, 'Final agent post instructions', cfg().agentPostInstructions,
+        value => { cfg().agentPostInstructions = value; save(); }, { type: 'textarea' });
+    post.append(element('p', 'enh_sa_hint', 'Supports SillyTavern macros plus {{agent_name}}, {{agent_max_tokens}} and {{agent_note_chars}}. A blank prompt disables the extra post instructions.'));
+    post.append(button('Restore default agent post instructions', () => {
+        cfg().agentPostInstructions = AGENT_POST_INSTRUCTIONS;
+        postInput.value = AGENT_POST_INSTRUCTIONS;
+        save();
+    }));
+    root.append(post);
     const writer = element('details', 'enh_sa_slot');
     writer.append(element('summary', '', 'Final writer instructions'));
     field(writer, 'How the writer should use the notes', cfg().writerPrompt, value => { cfg().writerPrompt = value; save(); }, { type: 'textarea' });
@@ -268,25 +293,19 @@ function cancelRun() {
 }
 
 async function fitWriterContext(messages, notes, maxTokens, signal) {
-    // Notes are added after ST has budgeted its prompt. Recount and remove
-    // oldest complete turns if needed, preserving system lore and recent input.
+    // Keep the preset's depth and position placements exact. Offer skipping
+    // notes instead of silently shifting injected prompts by dropping turns.
     const budget = Number(oai_settings.openai_max_context) - Number(maxTokens || oai_settings.openai_max_tokens) - 256;
     if (!Number.isFinite(budget) || budget <= 0) throw new Error('Set a valid context size in your chat completion settings.');
-    let base = structuredClone(messages);
-    let candidate = addWriterNotes(base, notes);
-    while (true) {
-        signal.throwIfAborted();
-        const count = await countTokensOpenAIAsync(candidate, true);
-        if (!Number.isFinite(count)) throw new Error('Could not count the final writer context.');
-        if (count <= budget) return candidate;
-        const smaller = dropOldestTurn(base);
-        if (!smaller) throw new Error('Agent notes exceed the available context. Reduce note length or increase the chat context size.');
-        base = smaller;
-        candidate = addWriterNotes(base, notes);
-    }
+    const candidate = addWriterNotes(messages, notes);
+    signal.throwIfAborted();
+    const count = await countTokensOpenAIAsync(candidate, true);
+    if (!Number.isFinite(count)) throw new Error('Could not count the final writer context.');
+    if (count > budget) throw new Error('Agent notes exceed the available context. Reduce note length or increase the chat context size. Preset messages have been kept in place.');
+    return candidate;
 }
 
-async function executeAgent(slot, messages, config, signal, connectionSettings) {
+async function executeAgent(slot, request, config, signal, connectionSettings) {
     const settings = structuredClone(connectionSettings);
     settings.openai_max_tokens = slot.maxTokens;
     settings.temp_openai = slot.temperature;
@@ -294,28 +313,19 @@ async function executeAgent(slot, messages, config, signal, connectionSettings) 
     settings.show_thoughts = false;
     settings.enable_web_search = false;
     settings.request_images = false;
-    const model = slot.model.trim() || getChatCompletionModel(settings);
-    // The specialist wrapper also takes space; trim old turns before quoting
-    // the context so a nearly full chat still leaves room for its notes.
+    const model = slot.model.trim() || request.model || getChatCompletionModel(settings);
     const budget = Number(settings.openai_max_context) - slot.maxTokens - 256;
-    let base = structuredClone(messages);
-    let agentMessages = buildAgentMessages(base, slot, substituteParams);
-    while (true) {
-        signal.throwIfAborted();
-        const count = await countTokensOpenAIAsync(agentMessages, true);
-        if (!Number.isFinite(count)) throw new Error('Could not count the agent context.');
-        if (count <= budget) break;
-        base = dropOldestTurn(base);
-        if (!base) throw new Error('Not enough context for this agent. Reduce its output tokens or increase the chat context size.');
-        agentMessages = buildAgentMessages(base, slot, substituteParams);
+    const agentMessages = buildAgentMessages(request.messages, slot, substituteParams, config);
+    signal.throwIfAborted();
+    const count = await countTokensOpenAIAsync(agentMessages, true);
+    if (!Number.isFinite(count)) throw new Error('Could not count the agent context.');
+    if (count > budget) throw new Error('Not enough context for this agent. Reduce output tokens or increase the chat context size. Preset messages have been kept in place.');
+    let modelParameters = null;
+    if (model !== request.model) {
+        settings.function_calling = false;
+        ({ generate_data: modelParameters } = await createGenerationParameters(settings, model, 'quiet', structuredClone(agentMessages)));
     }
-    const { generate_data } = await createGenerationParameters(settings, model, 'quiet', agentMessages);
-    generate_data.stream = false;
-    generate_data.n = 1;
-    delete generate_data.tools;
-    delete generate_data.tool_choice;
-    delete generate_data.json_schema;
-    delete generate_data.assistant_prefill;
+    const generate_data = buildAgentRequest(request, agentMessages, slot, modelParameters);
     const response = await previousFetch(ROUTE, {
         method: 'POST', headers: getRequestHeaders(), body: JSON.stringify(generate_data),
         signal: AbortSignal.any([signal, AbortSignal.timeout(config.timeoutSeconds * 1000)]),
@@ -376,7 +386,7 @@ async function interceptedFetch(input, init) {
     try {
         run.results = await runAgents(selection.slots, {
             concurrency: config.concurrency, signal,
-            execute: slot => executeAgent(slot, body.messages, config, signal, connectionSettings),
+            execute: slot => executeAgent(slot, body, config, signal, connectionSettings),
             onUpdate: (result, results) => {
                 if (result.status === 'working') result.started ??= Date.now();
                 else if (result.status !== 'queued') result.finished ??= Date.now();
@@ -391,7 +401,7 @@ async function interceptedFetch(input, init) {
         if (decision === null) throw abortError();
         let notes = decision === 'notes' ? compileNotes(run.results, config) : '';
         if (notes) {
-            try { body.messages = await fitWriterContext(body.messages, notes, body.max_tokens, signal); }
+            try { body.messages = await fitWriterContext(body.messages, notes, body.max_tokens ?? body.max_completion_tokens, signal); }
             catch (error) {
                 signal.throwIfAborted();
                 const choice = await reviewFailure(run, errorMessage(error), false);

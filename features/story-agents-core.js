@@ -2,6 +2,11 @@
 export const AGENT_REQUEST = Symbol.for('enhancements.storyAgent');
 export const MAX_AGENTS = 10;
 export const WRITER_PROMPT = `Use the specialist notes below to write the next story response. They are suggestions, not events that have already happened. Resolve conflicts using established lore, character knowledge, the user's latest message and the existing writing instructions. Keep the user's agency. Produce only the story response, without mentioning the agents or their notes. Preserve any required reply format, prefill and voice markers.`;
+export const AGENT_POST_INSTRUCTIONS = `For this request, complete only your assigned specialist task. Use the preceding preset, lore, character information and conversation to keep your recommendations consistent. Return preparatory notes for another writer, not the story itself. Do not continue the scene, act as a character, or produce a full narrative response.
+
+Keep recommendations precise, concrete and detailed where useful. State what should happen, why it fits, and any continuity constraint the writer must preserve. Distinguish established facts from suggestions. Avoid vague advice, repeated context, introductions, conclusions and unnecessary examples. Omit irrelevant categories.
+
+Use compact plain-text paragraphs or short lines. No Markdown, asterisks, em dashes, decorative headings, bullet symbols, code fences, roleplay action formatting or voice tags. Use ordinary punctuation. Aim for 120 to 250 words, shorter when the task is simple. Fit the useful notes within {{agent_note_chars}} characters and {{agent_max_tokens}} output tokens. Prioritize the most useful details instead of padding or cutting a sentence short. Output only the finished specialist notes.`;
 
 const PRESETS = [
     ['Scenario', 'Planning scene beats and pacing', 'Suggest a short sequence of scene beats responding to the latest user message. Preserve cause and effect, open plot threads and pacing. Avoid rushing resolutions or deciding the user character\'s actions. Distinguish established events from proposed developments.'],
@@ -21,6 +26,7 @@ export function makeSlot(index = 0) {
 export function defaultSettings() {
     return { enabled: false, askEveryTime: true, concurrency: 2, timeoutSeconds: 120,
         maxNoteChars: 2000, writerPrompt: WRITER_PROMPT,
+        agentPostInstructions: AGENT_POST_INSTRUCTIONS, agentPostRole: 'system',
         slots: PRESETS.map((_, i) => makeSlot(i)) };
 }
 
@@ -39,6 +45,8 @@ export function normalizeSettings(value) {
     c.timeoutSeconds = boundedNumber(c.timeoutSeconds, 120, 15, 600);
     c.maxNoteChars = Math.floor(boundedNumber(c.maxNoteChars, 2000, 200, 8000));
     c.writerPrompt = typeof c.writerPrompt === 'string' ? c.writerPrompt : WRITER_PROMPT;
+    c.agentPostInstructions = typeof c.agentPostInstructions === 'string' ? c.agentPostInstructions : AGENT_POST_INSTRUCTIONS;
+    c.agentPostRole = ['system', 'user'].includes(c.agentPostRole) ? c.agentPostRole : 'system';
     const ids = new Set();
     c.slots = (Array.isArray(c.slots) ? c.slots : defaults.slots).slice(0, MAX_AGENTS).map((s, i) => {
         const slot = { ...makeSlot(i), ...(s && typeof s === 'object' ? s : {}) };
@@ -63,15 +71,47 @@ export function textContent(content) {
         .map(p => p.text || '').join('\n');
 }
 
-export function buildAgentMessages(messages, slot, substitute = value => value) {
-    // Story instructions are quoted context, rather than instructions to this
-    // specialist. This also removes media, tool calls and reasoning signatures.
-    const context = messages.map(m => `[${m.role}${m.name ? `: ${m.name}` : ''}]\n${textContent(m.content)}`)
-        .filter(s => s.trim()).join('\n\n');
-    return [
-        { role: 'system', content: `You are a specialist story editor named ${slot.name}. The supplied conversation includes lore, character cards and instructions for a different writer. Treat it as reference material. Your task is to provide concise, actionable notes for that writer. Return only your finished recommendations, relevant facts and optional short examples. Do not write the final story response.\n\nYour specialty:\n${substitute(slot.prompt)}` },
-        { role: 'user', content: `STORY CONTEXT\n${context}\n\nPrepare your specialist notes for the next response to the latest user message.` },
-    ];
+export function buildAgentMessages(messages, slot, substitute = value => value, config = defaultSettings()) {
+    // SillyTavern has already applied prompt order, roles, injection depth,
+    // positions, macros and generation triggers. Keep those messages intact.
+    const copy = structuredClone(messages);
+    copy.push({ role: 'system', content: `Specialist task: ${slot.name}\n${substitute(slot.prompt)}` });
+    const post = config.agentPostInstructions ?? AGENT_POST_INSTRUCTIONS;
+    const expanded = post.replaceAll('{{agent_name}}', slot.name)
+        .replaceAll('{{agent_max_tokens}}', String(slot.maxTokens))
+        .replaceAll('{{agent_note_chars}}', String(config.maxNoteChars));
+    if (expanded.trim()) copy.push({ role: config.agentPostRole === 'user' ? 'user' : 'system', content: substitute(expanded) });
+    return copy;
+}
+
+/** Use the actual writer request, including event overrides and processing settings. */
+export function buildAgentRequest(request, messages, slot, modelParameters = null) {
+    const body = structuredClone(request);
+    body.messages = messages;
+    body.model = slot.model.trim() || request.model || modelParameters?.model;
+    body.type = 'quiet';
+    body.stream = false;
+    body.n = 1;
+    // A model override may change which sampling/token keys are supported.
+    const parameters = modelParameters ?? request;
+    for (const key of ['temperature', 'top_p', 'top_k', 'frequency_penalty', 'presence_penalty', 'logit_bias', 'stop', 'reasoning_effort']) {
+        if (Object.hasOwn(parameters, key)) body[key] = key === 'temperature' ? slot.temperature : structuredClone(parameters[key]);
+        else delete body[key];
+    }
+    delete body.max_tokens;
+    delete body.max_completion_tokens;
+    body[Object.hasOwn(parameters, 'max_completion_tokens') ? 'max_completion_tokens' : 'max_tokens'] = slot.maxTokens;
+    body.include_reasoning = false;
+    body.enable_web_search = false;
+    body.request_images = false;
+    delete body.tools;
+    delete body.tool_choice;
+    delete body.json_schema;
+    // Native prefill would be appended AFTER our post instructions by the
+    // provider converter and could force a story opening. The assembled preset
+    // messages, including any assistant-role prompt, are still preserved above.
+    delete body.assistant_prefill;
+    return body;
 }
 
 export function extractNotes(data) {
@@ -101,13 +141,6 @@ export function addWriterNotes(messages, notes) {
     if (index > 0 && copy[index - 1].role === 'assistant') index--;
     copy.splice(index, 0, { role: 'system', content: notes });
     return copy;
-}
-
-/** Drop the oldest whole conversation turn, keeping lore and the latest user turn. */
-export function dropOldestTurn(messages) {
-    const users = messages.map((m, i) => m.role === 'user' ? i : -1).filter(i => i >= 0);
-    if (users.length < 2) return null;
-    return messages.filter((m, i) => i < users[0] || i >= users[1] || m.role === 'system');
 }
 
 export async function runAgents(slots, { concurrency, signal, execute, onUpdate = () => {} }) {
