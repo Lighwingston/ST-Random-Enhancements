@@ -5,7 +5,7 @@ import { eventSource, event_types } from '../../../../events.js';
 import { oai_settings, createGenerationParameters, getChatCompletionModel, promptManager, Message, ChatCompletion } from '../../../../openai.js';
 import { countTokensOpenAIAsync } from '../../../../tokenizers.js';
 import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, compileNotes, addWriterNotes, runAgents, reorderSlots } from './story-agents-core.js';
-import { presetPrompts, presetKey, cleanPresetMetadata, excludePresetPrompts, installPresetTracking } from './story-agents-presets.js';
+import { presetPrompts, presetKey, cleanPresetMetadata, excludePresetPrompts, assertChatContext, installPresetTracking } from './story-agents-presets.js';
 import { readAgentResponse } from './story-agents-stream.js';
 import { fetchWriterWithRetries } from './story-agents-writer.js';
 
@@ -366,13 +366,18 @@ function renderProgress(run) {
                 renderProgress(run);
             });
             heading.append(element('span', 'enh_sa_agent_status'), skip);
-            card.append(heading, element('pre', 'enh_sa_notes'));
+            const contextView = element('details', 'enh_sa_context');
+            contextView.append(element('summary', '', 'View context'));
+            card.contextText = element('pre', 'enh_sa_notes');
+            contextView.append(card.contextText);
+            card.append(heading, element('pre', 'enh_sa_notes'), contextView);
             rows.append(card);
         }
         const elapsed = result.started ? ` (${Math.floor(((result.finished || Date.now()) - result.started) / 1000)}s)` : '';
         const status = { queued: 'Queued', working: result.slot.activity || 'Preparing notes', retrying: 'Waiting to retry', done: 'Finished', failed: 'Failed', cancelled: 'Cancelled', skipped: 'Skipped' }[result.status];
         card.querySelector('span').textContent = `${result.slot.name} — ${status}${result.attempt > 1 ? ` · attempt ${result.attempt}` : ''}${elapsed}`;
         card.querySelector('pre').textContent = result.error || result.notes || 'Waiting for finished notes…';
+        card.contextText.textContent = result.context || 'Context will appear when this agent starts.';
         card.querySelector('button').hidden = !['queued', 'working', 'retrying'].includes(result.status) || run.phase !== 'agents';
         card.dataset.status = result.status;
     }
@@ -404,7 +409,7 @@ async function fitWriterContext(messages, notes, maxTokens, signal) {
     return candidate;
 }
 
-async function executeAgent(slot, request, config, signal, connectionSettings, onNotes, previousResults, agentBase) {
+async function executeAgent(slot, request, config, signal, connectionSettings, onNotes, previousResults, agentBase, onContext = () => {}) {
     const settings = structuredClone(connectionSettings);
     settings.openai_max_tokens = slot.maxTokens;
     settings.temp_openai = slot.temperature;
@@ -419,6 +424,9 @@ async function executeAgent(slot, request, config, signal, connectionSettings, o
         agentMessages = buildAgentMessages(agentBase, slot, substituteParams, config, previousResults);
         signal.throwIfAborted();
         const count = await countTokensOpenAIAsync(agentMessages, true);
+        // Keep only prompt fields for inspection. Never store credentials,
+        // headers, URLs or arbitrary custom request parameters in the view.
+        onContext(`Model: ${model}\nInput tokens: ${count} / ${budget}\nBase context: ${agentBase.length} messages\nPreset post-processing: ${request.custom_prompt_post_processing || 'none'}\n\nThese are the exact messages supplied to the request before provider post-processing and transport conversion. Those steps may merge messages or convert unsupported roles.\n\n${agentMessages.map((m, i) => `Message ${i + 1} | ${m.role}${m.name ? ` | ${m.name}` : ''}\n${typeof m.content === 'string' ? m.content : JSON.stringify(m.content, null, 2)}`).join('\n\n')}`);
         if (!Number.isFinite(count)) throw new Error('Could not count the agent context.');
         if (count > budget) throw new Error('Not enough context for this agent. Reduce output tokens or increase the chat context size. Preset messages have been kept in place.');
     } catch (error) { error.retryable = false; throw error; }
@@ -525,13 +533,20 @@ async function interceptedFetch(input, init) {
     try {
         let agentBase;
         let baseError;
-        try { agentBase = excludePresetPrompts(sourceMessages, config.ignoredPresetPrompts[presetKey(connectionSettings)] ?? []); }
+        try {
+            assertChatContext(sourceMessages, selection.chat);
+            agentBase = excludePresetPrompts(sourceMessages, config.ignoredPresetPrompts[presetKey(connectionSettings)] ?? []);
+        }
         catch (error) { error.retryable = false; baseError = error; }
         run.results = await runAgents(selection.slots, {
             signal, maxRetries: config.maxRetries, retryDelayMs: config.retryDelaySeconds * 1000,
             execute: (slot, onNotes, previous, agentSignal) => {
                 if (baseError) throw baseError;
-                return executeAgent(slot, body, config, agentSignal, connectionSettings, onNotes, previous, agentBase);
+                return executeAgent(slot, body, config, agentSignal, connectionSettings, onNotes, previous, agentBase, value => {
+                    const result = run.results.find(r => r.slot.id === slot.id);
+                    if (result) result.context = value;
+                    renderProgress(run);
+                });
             },
             onUpdate: (result, results) => {
                 if (result?.status === 'working') result.started ??= Date.now();

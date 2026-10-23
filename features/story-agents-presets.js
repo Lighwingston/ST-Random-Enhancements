@@ -22,6 +22,16 @@ export function cleanPresetMetadata(messages) {
     return structuredClone(messages).map(message => { delete message[PRESET_META]; return message; });
 }
 
+/** ST can return a partial prompt after an assembly error or a disabled history marker. */
+export function assertChatContext(messages, chat) {
+    if (!chat?.some(m => typeof m.mes === 'string' && m.mes.trim() && !m.is_system)) return;
+    // Older / independently built requests have no provenance; do not guess
+    // based on role alone because preset and lore prompts can use any role.
+    if (messages.length && !messages.every(m => typeof m[PRESET_META]?.identifier === 'string')) return;
+    if (messages.some(m => /^(chatHistory-|continuePrefill$|continueNudge$)/.test(m[PRESET_META].identifier))) return;
+    throw new Error('SillyTavern assembled this request without chat history. Enable the Chat History prompt marker and check the context budget or prompt assembly errors. Agents were stopped instead of working without the scene.');
+}
+
 export function excludePresetPrompts(messages, ignored) {
     if (!ignored.length) return cleanPresetMetadata(messages);
     if (!messages.every(m => m[PRESET_META]?.version === 1)) {
@@ -140,7 +150,7 @@ export function installPresetTracking({ getManager, Message, ChatCompletion, ena
         if (!enabled()) return chat;
         const flat = this.messages.flatten().filter(m => m.content || m.tool_calls);
         if (flat.length !== chat.length) return chat;
-        chat.forEach((m, i) => { m[PRESET_META] = { version: 1, fingerprint: fingerprint(m.content), ranges: flat[i][SOURCE] ?? [] }; });
+        chat.forEach((m, i) => { m[PRESET_META] = { version: 1, identifier: flat[i].identifier, fingerprint: fingerprint(m.content), ranges: flat[i][SOURCE] ?? [] }; });
         return chat;
     };
     hookManager();
