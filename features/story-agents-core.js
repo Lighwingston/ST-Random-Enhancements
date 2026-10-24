@@ -186,6 +186,7 @@ export async function runAgents(slots, { signal, execute, maxRetries = 0, retryD
                 result.status = 'working';
                 result.notes = '';
                 result.error = '';
+                result.retryAt = null;
                 onUpdate(result, results);
                 try {
                     result.notes = await execute(result.slot, notes => {
@@ -205,8 +206,10 @@ export async function runAgents(slots, { signal, execute, maxRetries = 0, retryD
                     if (attempt >= maxRetries || error?.retryable === false) throw error;
                     result.status = 'retrying';
                     result.notes = '';
+                    const delay = Math.max(error.retryAfter || 0, Math.min(retryDelayMs * 2 ** attempt, 60000));
+                    result.retryAt = Date.now() + delay;
                     onUpdate(result, results);
-                    await retryWait(retryDelayMs * 2 ** attempt, agentSignal);
+                    await retryWait(delay, agentSignal);
                 }
             }
         } catch (error) {

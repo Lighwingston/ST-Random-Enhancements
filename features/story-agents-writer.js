@@ -35,10 +35,18 @@ async function providerError(response) {
     }
     try {
         const data = JSON.parse(text);
-        const message = data.error?.message || data.message || data.detail || data.error;
+        const message = data.error?.message || data.error?.detail || data.message || data.detail || data.error;
         if (typeof message === 'string' && message.trim()) return message.trim().slice(0, 500);
     } catch { /* Plain-text errors are common for proxy rejections. */ }
     if (text && !text.startsWith('<')) return text.slice(0, 500);
+    // Gateways often return HTML rather than the provider's JSON error.
+    // Keep a short title/heading so an unavailable Kaggle tunnel can be
+    // distinguished from a provider rejection without showing an HTML page.
+    if (text.startsWith('<')) {
+        const heading = text.match(/<title[^>]*>([\s\S]*?)<\/title>/i)?.[1]
+            || text.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i)?.[1];
+        if (heading) return heading.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().slice(0, 500);
+    }
     return response.statusText || 'The provider did not return a successful response.';
 }
 
@@ -50,12 +58,20 @@ function delayFromHeader(response) {
     return Number.isFinite(ms) ? Math.max(0, Math.min(ms, 60000)) : 0;
 }
 
+/** Share bounded error-body parsing and Retry-After handling with specialists. */
+export async function apiResponseError(response, label = 'Writer') {
+    const error = responseError(response.status, await providerError(response), delayFromHeader(response));
+    error.message = error.message.replace(/^Writer API/, `${label} API`);
+    error.status = response.status;
+    return error;
+}
+
 async function validateResponse(response) {
     const status = response.status;
     const retryAfter = delayFromHeader(response);
     // Some wrappers report a stale .ok flag. HTTP status is authoritative.
     if (status < 200 || status >= 300) {
-        throw responseError(status, await providerError(response), retryAfter);
+        throw await apiResponseError(response);
     }
     const type = response.headers.get('content-type') || '';
     if (/text\/event-stream/i.test(type)) {

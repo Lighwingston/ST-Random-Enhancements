@@ -7,7 +7,7 @@ import { countTokensOpenAIAsync } from '../../../../tokenizers.js';
 import { AGENT_REQUEST, AGENT_POST_INSTRUCTIONS, MAX_AGENTS, makeSlot, normalizeSettings, buildAgentMessages, buildAgentRequest, compileNotes, addWriterNotes, runAgents, reorderSlots } from './story-agents-core.js';
 import { presetPrompts, presetKey, cleanPresetMetadata, excludePresetPrompts, assertChatContext, installPresetTracking } from './story-agents-presets.js';
 import { readAgentResponse } from './story-agents-stream.js';
-import { fetchWriterWithRetries } from './story-agents-writer.js';
+import { fetchWriterWithRetries, apiResponseError } from './story-agents-writer.js';
 
 const ROUTE = '/api/backends/chat-completions/generate';
 const SUPPORTED_TYPES = new Set(['normal', 'regenerate', 'swipe', 'continue']);
@@ -374,11 +374,13 @@ function renderProgress(run) {
             rows.append(card);
         }
         const elapsed = result.started ? ` (${Math.floor(((result.finished || Date.now()) - result.started) / 1000)}s)` : '';
-        const status = { queued: 'Queued', working: result.slot.activity || 'Preparing notes', retrying: 'Waiting to retry', done: 'Finished', failed: 'Failed', cancelled: 'Cancelled', skipped: 'Skipped' }[result.status];
+        const remaining = result.retryAt ? Math.max(0, Math.ceil((result.retryAt - Date.now()) / 1000)) : 0;
+        const status = { queued: 'Queued', working: result.slot.activity || 'Preparing notes', retrying: `Retrying in ${remaining}s`, done: 'Finished', failed: 'Failed', cancelled: 'Cancelled', skipped: 'Skipped' }[result.status];
         card.querySelector('span').textContent = `${result.slot.name} — ${status}${result.attempt > 1 ? ` · attempt ${result.attempt}` : ''}${elapsed}`;
         card.querySelector('pre').textContent = result.error || result.notes || 'Waiting for finished notes…';
         card.contextText.textContent = result.context || 'Context will appear when this agent starts.';
         card.querySelector('button').hidden = !['queued', 'working', 'retrying'].includes(result.status) || run.phase !== 'agents';
+        if (result.status === 'failed' && card.dataset.status !== 'failed') card.open = true;
         card.dataset.status = result.status;
     }
 }
@@ -442,11 +444,8 @@ async function executeAgent(slot, request, config, signal, connectionSettings, o
         signal: requestSignal,
         [AGENT_REQUEST]: true,
     });
-    if (!response.ok) {
-        const error = new Error(`Agent API request failed (${response.status}).`);
-        error.retryable = response.status === 408 || response.status === 429 || response.status >= 500;
-        throw error;
-    }
+    requestSignal.throwIfAborted();
+    if (response.status < 200 || response.status >= 300) throw await apiResponseError(response, 'Agent');
     return readAgentResponse(response, requestSignal, onNotes, config.streamAgents);
 }
 
